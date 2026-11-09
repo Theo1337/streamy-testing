@@ -27,6 +27,48 @@
   let section = "general";
   let pickerTab = "displays";
   let viewMode = "settings";
+  let pickingMonitorForSettings = false;
+  let updateProgress = 0;
+  let updateTotal = 0;
+  let updateVersion = "";
+  let updatePhase = "checking";
+  let updateError = "";
+  let updateTerminal = false;
+  let updateComplete = false;
+  let updatePollingInFlight = false;
+  let updateProgressTimer = null;
+  let updateCloseScheduled = false;
+  let updatePollingActive = false;
+  let checkingUpdate = false;
+  let updateCheckMessage = "";
+  let updateCheckError = false;
+
+  $: updateDeterminate = updateTotal > 0 && updatePhase === "downloading";
+  $: updatePercent = updateDeterminate
+    ? Math.min(100, Math.max(0, (updateProgress / updateTotal) * 100))
+    : 0;
+  $: updatePhaseText = updatePhaseLabel(updatePhase);
+
+  function updatePhaseLabel(phase) {
+    switch (phase) {
+      case "checking": return "Checking for updates…";
+      case "downloading": return "Downloading update…";
+      case "waiting-for-idle": return "Update downloaded — waiting for Streamy to be idle…";
+      case "installing": return "Installing update silently…";
+      case "restarting": return "Restarting Streamy…";
+      case "complete": return "Update complete.";
+      case "failed": return "Update could not be completed.";
+      default: return "Preparing update…";
+    }
+  }
+
+  function formatBytes(bytes) {
+    if (bytes === 0 || bytes === undefined) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  }
 
   const navItems = [
     { id: "general", label: "General" },
@@ -154,6 +196,68 @@
     }
   }
 
+  async function pollUpdateProgress() {
+    if (updatePollingInFlight) return;
+    updatePollingInFlight = true;
+    try {
+      const api = bridge();
+      if (!api) return;
+      const progress = await api.GetUpdateProgress();
+      if (!progress) return;
+      updateProgress = Number(progress.progress) || 0;
+      updateTotal = Number(progress.total) || 0;
+      updateVersion = progress.version || "";
+      updatePhase = progress.phase || (progress.installing ? "installing" : "downloading");
+      updateError = progress.error || "";
+      updateTerminal = Boolean(progress.terminal) || updatePhase === "failed" || updatePhase === "complete" || updatePhase === "idle";
+      updateComplete = Boolean(progress.complete) || updatePhase === "complete";
+      if (updatePhase === "restarting" && !updateCloseScheduled) {
+        updateCloseScheduled = true;
+        // The tray will close this process as soon as the helper has accepted
+        // the handoff. This is only a fallback for a slow Wails shutdown.
+        setTimeout(() => bridge()?.CloseWindow?.(), 1200);
+      }
+      // Stop polling on explicit terminal states (failed, complete, restarting handoff)
+      if (updateTerminal) {
+        stopUpdateProgressPolling();
+      }
+    } catch (e) {
+      // The tray may already be shutting down after handing off the update.
+      // Treat transport loss during installing/restarting/waiting-for-idle as
+      // expected shutdown, not a failure. Only mark failed if we have a
+      // confirmed backend failure or were already in a terminal state.
+      const expectedHandoffPhases = ["installing", "restarting", "waiting-for-idle"];
+      if (!expectedHandoffPhases.includes(updatePhase) && !updateTerminal) {
+        updateError = e.message || String(e);
+        updatePhase = "failed";
+        updateTerminal = true;
+        stopUpdateProgressPolling();
+      }
+    } finally {
+      updatePollingInFlight = false;
+    }
+  }
+
+  function startUpdateProgressPolling() {
+    if (updateProgressTimer) clearInterval(updateProgressTimer);
+    updatePollingActive = true;
+    updateCloseScheduled = false;
+    void pollUpdateProgress();
+    // Poll even when the window is hidden: installation is automatic and a
+    // hidden-document pause used to leave the view stuck forever.
+    updateProgressTimer = setInterval(() => {
+      if (updatePollingActive) void pollUpdateProgress();
+    }, 500);
+  }
+
+  function stopUpdateProgressPolling() {
+    updatePollingActive = false;
+    if (updateProgressTimer) {
+      clearInterval(updateProgressTimer);
+      updateProgressTimer = null;
+    }
+  }
+
   onMount(() => {
     let active = true;
     // Preview capture is a full-screen GDI copy, so it is deliberately slow
@@ -163,26 +267,33 @@
       if (active && !document.hidden && cfg?.setupComplete && viewMode === "share" && selected.kind) void refreshPreview();
     }, 2500);
     const statusTimer = setInterval(() => {
-      if (active && !document.hidden) {
+      if (active && !document.hidden && viewMode !== "update") {
         void refreshStatus().catch((e) => error = e.message || String(e));
       }
     }, 2000);
     const onVisibility = () => {
-      if (!document.hidden && active) void refreshStatus().catch(() => {});
+      if (!document.hidden && active && viewMode !== "update") void refreshStatus().catch(() => {});
     };
     document.addEventListener("visibilitychange", onVisibility);
+
     (async () => {
       try {
         const api = bridge();
         if (!api) throw new Error("Settings bridge is unavailable. Launch this window from the Streamy tray.");
         viewMode = (await api.GetView?.()) || "settings";
-        cfg = await api.GetConfig();
-        const initialResults = await Promise.allSettled([refreshTargets(), refreshStatus(), refreshIdentity()]);
-        const failed = initialResults.find((result) => result.status === "rejected");
-        if (failed?.status === "rejected") {
-          error = failed.reason?.message || String(failed.reason);
+        if (viewMode === "update") {
+          // Update view doesn't need config; start polling immediately.
+          startUpdateProgressPolling();
+        } else {
+          // Settings and share views require config.
+          cfg = await api.GetConfig();
+          const initialResults = await Promise.allSettled([refreshTargets(), refreshStatus(), refreshIdentity()]);
+          const failed = initialResults.find((result) => result.status === "rejected");
+          if (failed?.status === "rejected") {
+            error = failed.reason?.message || String(failed.reason);
+          }
+          if (cfg.setupComplete && viewMode === "share") await refreshPreview();
         }
-        if (cfg.setupComplete && viewMode === "share") await refreshPreview();
       } catch (e) {
         error = e.message || String(e);
       } finally {
@@ -193,6 +304,7 @@
       active = false;
       clearInterval(previewTimer);
       clearInterval(statusTimer);
+      stopUpdateProgressPolling();
       document.removeEventListener("visibilitychange", onVisibility);
     };
   });
@@ -357,6 +469,10 @@
       }
       await new Promise((resolve) => setTimeout(resolve, 300));
       await refreshStatus();
+      // Close the picker window when streaming starts successfully
+      if (status.sharing) {
+        bridge()?.CloseWindow?.();
+      }
     } catch (e) {
       error = e.message || String(e);
     } finally {
@@ -417,11 +533,67 @@
     }
   }
 
+  async function checkForUpdates() {
+    checkingUpdate = true;
+    updateCheckMessage = "";
+    updateCheckError = false;
+    try {
+      const result = await bridge().CheckForUpdates();
+      if (result && result.started) {
+        // Update check started - poll for progress
+        updatePhase = result.phase || "checking";
+        updateProgress = Number(result.progress) || 0;
+        updateTotal = Number(result.total) || 0;
+        updateVersion = result.version || "";
+        updateError = result.error || "";
+        updateTerminal = Boolean(result.terminal) || result.phase === "idle";
+        updateComplete = Boolean(result.complete);
+        await pollUpdateProgressUntilChecked();
+        if (updatePhase === "idle" && !updateError) {
+          updateCheckMessage = "Streamy is up to date.";
+          updateCheckError = false;
+        } else if (updatePhase === "failed") {
+          updateCheckError = true;
+          updateCheckMessage = updateError || "Update check failed.";
+        } else if (updatePhase !== "complete" && updatePhase !== "restarting") {
+          updateCheckMessage = "Update available. Follow the update window.";
+          updateCheckError = false;
+        }
+      } else {
+        updateCheckError = true;
+        updateCheckMessage = "Update check was not started.";
+      }
+    } catch (e) {
+      updateCheckError = true;
+      updateCheckMessage = e.message || String(e);
+    } finally {
+      checkingUpdate = false;
+    }
+  }
+
+  async function pollUpdateProgressUntilChecked() {
+    // The backend starts the check asynchronously. Stop as soon as it reports a
+    // phase other than "checking"; the dedicated update window follows the
+    // download and install from there.
+    while (updatePhase === "checking" || updatePhase === "") {
+      await new Promise((r) => setTimeout(r, 1000));
+      await pollUpdateProgress();
+    }
+  }
+
   function pickMonitor(monitor) {
     selected = { kind: "monitor", index: monitor.index, handle: "" };
     previewData = "";
     void refreshPreview();
-    if (status.sharing) void startShareFor({ kind: "monitor", index: monitor.index, handle: "" });
+    if (pickingMonitorForSettings) {
+      // User picked a monitor from settings - save the index and return to settings
+      cfg = { ...cfg, capture: { ...cfg.capture, monitorIndex: monitor.index, defaultTarget: "monitor" } };
+      pickingMonitorForSettings = false;
+      viewMode = "settings";
+      void save();
+    } else if (status.sharing) {
+      void startShareFor({ kind: "monitor", index: monitor.index, handle: "" });
+    }
   }
 
   function pickWindow(win) {
@@ -430,10 +602,17 @@
     void refreshPreview();
     if (status.sharing) void startShareFor({ kind: "window", index: 0, handle: String(win.handle) });
   }
+
+  function openMonitorPicker() {
+    pickingMonitorForSettings = true;
+    viewMode = "share";
+    pickerTab = "displays";
+    void refreshTargets().catch((e) => (error = e.message || String(e)));
+  }
 </script>
 
 <svelte:head>
-  <title>{viewMode === "share" ? "Streamy — Share your screen" : "Streamy settings"}</title>
+  <title>{viewMode === "share" ? "Streamy — Share your screen" : viewMode === "update" ? "Streamy — Updating" : "Streamy settings"}</title>
 </svelte:head>
 
 <svelte:window onkeydown={recordHotkey} />
@@ -455,6 +634,41 @@
 
 {#if loading}
   <div class="stage"><p class="muted">Loading settings and capture targets…</p></div>
+{:else if viewMode === "update"}
+  <main class="update-window" aria-live="polite">
+    <section class="update-card">
+      <img class="update-icon" src="./icon.png" alt="" />
+      <h1>Updating Streamy</h1>
+      <p class="update-status">{updatePhaseText}</p>
+      {#if updateVersion}
+        <p class="update-version">Version {updateVersion}</p>
+      {/if}
+
+      {#if updateDeterminate}
+        <div class="progress-container" aria-label="Download progress">
+          <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(updatePercent)}>
+            <div class="progress-fill" style="width: {updatePercent}%"></div>
+          </div>
+          <span class="progress-text">{(updateProgress / 1024 / 1024).toFixed(1)} MB of {(updateTotal / 1024 / 1024).toFixed(1)} MB</span>
+        </div>
+      {:else if updatePhase === "downloading" || updatePhase === "checking" || updatePhase === "installing" || updatePhase === "waiting-for-idle"}
+        <div class="progress-container" aria-label="Update progress">
+          <div class="progress-bar indeterminate"><div class="progress-fill"></div></div>
+          {#if updateProgress > 0}<span class="progress-text">{(updateProgress / 1024 / 1024).toFixed(1)} MB downloaded</span>{/if}
+        </div>
+      {/if}
+
+      {#if updatePhase === "failed"}
+        <p class="update-error" role="alert">{updateError || "The update failed. Streamy was not changed."}</p>
+      {:else if updatePhase === "complete"}
+        <p class="update-success">Streamy will close and restart with the new version.</p>
+      {:else if updatePhase === "restarting"}
+        <p class="update-note">The installer handoff was accepted. This window will close automatically.</p>
+      {:else}
+        <p class="update-note">No action is required. Streamy will finish when it is safe to restart.</p>
+      {/if}
+    </section>
+  </main>
 {:else if !cfg}
   <div class="stage"><p class="muted">Settings couldn't load. Open this window from the Streamy tray icon.</p></div>
 {:else if !cfg.setupComplete}
@@ -495,20 +709,20 @@
             <span class="field-label">Default capture target</span>
             <select bind:value={cfg.capture.defaultTarget}>
               <option value="primary">Primary display</option>
-              <option value="mouse">Display under pointer</option>
               <option value="focused">Focused window</option>
               <option value="monitor">Specific display</option>
             </select>
           </label>
           {#if cfg.capture.defaultTarget === "monitor"}
-            <label class="field">
+            <div class="field">
               <span class="field-label">Specific display</span>
-              <select bind:value={cfg.capture.monitorIndex}>
-                {#each monitors as monitor}
-                  <option value={monitor.index}>{monitorName(monitor)} · {monitorResolution(monitor.bounds)}</option>
-                {/each}
-              </select>
-            </label>
+              <button type="button" class="btn" onclick={() => openMonitorPicker()}>
+                Pick display
+              </button>
+              {#if monitors.length > 0}
+                <span class="muted" style="margin-left: 12px;">Current: {monitorName(monitors[cfg.capture.monitorIndex] || monitors[0])}</span>
+              {/if}
+            </div>
           {/if}
         </div>
         <div class="rows">
@@ -721,6 +935,7 @@
                     <i class="track" aria-hidden="true"></i>
                   </label>
                 </div>
+                {#if cfg.hotkey.enabled}
                 <div class="fields spaced">
                   <div class="field">
                     <span class="field-label">Toggle hotkey</span>
@@ -751,7 +966,47 @@
                     </button>
                   </div>
                 </div>
+                {/if}
                 {#if hotkeyError}<p class="inline-error" role="alert">{hotkeyError}</p>{/if}
+
+                <h2 class="group-title">Updates</h2>
+                <div class="rows">
+                  <label class="toggle">
+                    <span class="toggle-text">Disable automatic update checks<small>Required updates will still be installed automatically.</small></span>
+                    <input type="checkbox" bind:checked={cfg.update.autoUpdateDisabled} />
+                    <i class="track" aria-hidden="true"></i>
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={checkingUpdate}
+                  onclick={checkForUpdates}
+                >
+                  {#if checkingUpdate}
+                    <span class="spinner"></span> Checking...
+                  {:else}
+                    Check for updates now
+                  {/if}
+                </button>
+                {#if checkingUpdate}
+                  <div class="update-progress" role="status" aria-live="polite">
+                    <p class="update-phase">{updatePhaseText}</p>
+                    <div class="progress-bar">
+                      {#if updateDeterminate}
+                        <div class="progress-fill" style="width: {updatePercent}%"></div>
+                        <span class="progress-text">{formatBytes(updateProgress)} / {formatBytes(updateTotal)}</span>
+                      {:else}
+                        <div class="progress-fill indeterminate"></div>
+                        <span class="progress-text">Checking for updates…</span>
+                      {/if}
+                    </div>
+                    {#if updateVersion}<p class="update-version">Version {updateVersion}</p>{/if}
+                    {#if updateError && updatePhase === "failed"}<p class="update-error">{updateError}</p>{/if}
+                  </div>
+                {:else if updateCheckMessage}
+                  <p class="update-check-message" class:error={updateCheckError}>{updateCheckMessage}</p>
+                {/if}
 
                 <h2 class="group-title">Capture</h2>
                 <div class="fields">
@@ -759,26 +1014,28 @@
                     <span class="field-label">Default target</span>
                     <select bind:value={cfg.capture.defaultTarget}>
                       <option value="primary">Primary display</option>
-                      <option value="mouse">Display under pointer</option>
                       <option value="focused">Focused window</option>
                       <option value="monitor">Specific display</option>
                     </select>
                   </label>
                 </div>
+                {#if cfg.capture.defaultTarget === "monitor"}
+                <div class="rows spaced">
+                  <div class="field">
+                    <span class="field-label">Specific display</span>
+                    <button type="button" class="btn" onclick={() => openMonitorPicker()}>
+                      Pick display
+                    </button>
+                    {#if monitors.length > 0}
+                      <span class="muted" style="margin-left: 12px;">Current: {monitorName(monitors[cfg.capture.monitorIndex] || monitors[0])}</span>
+                    {/if}
+                  </div>
+                </div>
+                {/if}
                 <div class="rows spaced">
                   <label class="toggle">
                     <span class="toggle-text">Always show picker instead of auto-selecting</span>
                     <input type="checkbox" bind:checked={cfg.capture.alwaysShowPicker} />
-                    <i class="track" aria-hidden="true"></i>
-                  </label>
-                  <label class="toggle">
-                    <span class="toggle-text">Follow fullscreen target changes while sharing</span>
-                    <input type="checkbox" bind:checked={cfg.capture.autoSwitchTarget} />
-                    <i class="track" aria-hidden="true"></i>
-                  </label>
-                  <label class="toggle">
-                    <span class="toggle-text">Show cursor in the stream</span>
-                    <input type="checkbox" bind:checked={cfg.capture.captureCursor} />
                     <i class="track" aria-hidden="true"></i>
                   </label>
                   <label class="toggle">
@@ -794,6 +1051,28 @@
                     </label>
                   {/if}
                 </div>
+
+                <h2 class="group-title">Live indicator</h2>
+                <div class="rows">
+                  <label class="toggle">
+                    <span class="toggle-text">Show a blinking red dot while live<small>Always above other windows and kept out of your stream.</small></span>
+                    <input type="checkbox" bind:checked={cfg.indicator.enabled} />
+                    <i class="track" aria-hidden="true"></i>
+                  </label>
+                </div>
+                {#if cfg.indicator.enabled}
+                  <div class="fields">
+                    <label class="field">
+                      <span class="field-label">Position</span>
+                      <select bind:value={cfg.indicator.position}>
+                        <option value="top-right">Top right</option>
+                        <option value="top-left">Top left</option>
+                        <option value="bottom-right">Bottom right</option>
+                        <option value="bottom-left">Bottom left</option>
+                      </select>
+                    </label>
+                  </div>
+                {/if}
 
               {:else if section === "identity"}
                 <h1>Public stream identity</h1>
@@ -1138,6 +1417,111 @@
   .hint { font-size: 14px; color: var(--text-muted); }
   .setup-card .hint { margin-top: 12px; }
   .inline-error { margin-top: 8px; font-size: 14px; color: #fa777c; }
+
+  /* Update check button */
+  .update-check-message {
+    margin-top: 12px;
+    font-size: 14px;
+    color: var(--green);
+  }
+  .update-check-message.error {
+    color: #fa777c;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--text-muted);
+    border-top-color: var(--brand);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  /* Dedicated update window */
+  .update-window {
+    box-sizing: border-box;
+    height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: var(--bg-tertiary);
+    overflow: hidden;
+  }
+  .update-card {
+    width: min(430px, 100%);
+    padding: 28px 32px 24px;
+    border-radius: 8px;
+    background: var(--bg-primary);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+    text-align: center;
+  }
+  .update-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    margin: 0 auto 14px;
+    object-fit: contain;
+  }
+  .update-card h1 {
+    margin: 0 0 8px;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .update-status {
+    margin: 0 0 4px;
+    color: var(--text-normal);
+    font-size: 15px;
+  }
+  .update-version {
+    margin: 0 0 18px;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .progress-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 18px;
+  }
+  .progress-bar {
+    height: 8px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: var(--brand);
+    transition: width 0.3s ease;
+  }
+  .progress-bar.indeterminate .progress-fill {
+    width: 40%;
+    animation: update-indeterminate 1.25s ease-in-out infinite;
+  }
+  @keyframes update-indeterminate {
+    0% { transform: translateX(-125%); }
+    100% { transform: translateX(275%); }
+  }
+  .progress-text {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: right;
+  }
+  .update-note, .update-success, .update-error {
+    margin-top: 18px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .update-success { color: var(--green); }
+  .update-error { color: #fa777c; text-align: left; word-break: break-word; }
+
 
   @media (max-width: 760px) {
     .app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }

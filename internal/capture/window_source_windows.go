@@ -79,10 +79,20 @@ type streamBitmapInfoHeader struct {
 type WindowFrameSource struct {
 	hwnd uintptr
 
-	windowX   int
-	windowY   int
-	srcWidth  int
-	srcHeight int
+	// rawRect is the GetWindowRect bounds of the window. PrintWindow renders
+	// into a DC sized to these dimensions, so all offset arithmetic is done
+	// in this coordinate space, not the DWM extended frame space.
+	rawX   int
+	rawY   int
+	rawW   int
+	rawH   int
+
+	// Client rect (content area only, excluding title bar and borders)
+	clientX      int
+	clientY      int
+	clientWidth  int
+	clientHeight int
+
 	outWidth  int
 	outHeight int
 	fps       int
@@ -111,15 +121,30 @@ func NewWindowFrameSource(ctx context.Context, window Window, maxResolution stri
 	if window.Rect.Empty() {
 		return nil, errors.New("window has empty bounds")
 	}
-	if window.Rect.Width > 16384 || window.Rect.Height > 16384 {
+
+	// RawRect is the actual GetWindowRect size that PrintWindow renders into.
+	// If not populated (older code path or non-Windows build) fall back to Rect.
+	rawRect := window.RawRect
+	if rawRect.Empty() {
+		rawRect = window.Rect
+	}
+
+	if rawRect.Width > 16384 || rawRect.Height > 16384 {
 		return nil, errors.New("window dimensions exceed the safe limit")
 	}
-	if int64(window.Rect.Width)*int64(window.Rect.Height) > 40_000_000 {
+	if int64(rawRect.Width)*int64(rawRect.Height) > 40_000_000 {
 		return nil, errors.New("window area exceeds the safe limit")
 	}
 
+	// Use client rect for output dimensions (excludes title bar and borders)
+	clientRect := window.ClientRect
+	if clientRect.Empty() {
+		// Fall back to frame rect if client rect is not available
+		clientRect = window.Rect
+	}
+
 	maxWidth, maxHeight := parseMaxResolution(maxResolution)
-	width, height := fitPreview(window.Rect.Width, window.Rect.Height, maxWidth, maxHeight)
+	width, height := fitPreview(clientRect.Width, clientRect.Height, maxWidth, maxHeight)
 	// H.264 4:2:0 needs even dimensions. Rounding down is enough; the
 	// PrintWindow source is stretched to this exact size below.
 	width &^= 1
@@ -143,19 +168,23 @@ func NewWindowFrameSource(ctx context.Context, window Window, maxResolution stri
 		captureFPS = 30
 	}
 	s := &WindowFrameSource{
-		hwnd:      window.Handle,
-		windowX:   window.Rect.X,
-		windowY:   window.Rect.Y,
-		srcWidth:  window.Rect.Width,
-		srcHeight: window.Rect.Height,
-		outWidth:  width,
-		outHeight: height,
-		fps:       captureFPS,
-		drawMouse: drawMouse,
-		listener:  listener,
-		ctx:       childCtx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
+		hwnd:         window.Handle,
+		rawX:         rawRect.X,
+		rawY:         rawRect.Y,
+		rawW:         rawRect.Width,
+		rawH:         rawRect.Height,
+		clientX:      clientRect.X,
+		clientY:      clientRect.Y,
+		clientWidth:  clientRect.Width,
+		clientHeight: clientRect.Height,
+		outWidth:     width,
+		outHeight:    height,
+		fps:          captureFPS,
+		drawMouse:    drawMouse,
+		listener:     listener,
+		ctx:          childCtx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
 	}
 	go s.serve()
 	return s, nil
@@ -221,7 +250,7 @@ func (s *WindowFrameSource) serve() {
 		s.mu.Unlock()
 	}()
 
-	grabber, err := newWindowGrabber(s.hwnd, s.windowX, s.windowY, s.srcWidth, s.srcHeight, s.outWidth, s.outHeight, s.drawMouse)
+	grabber, err := newWindowGrabber(s.hwnd, s.rawX, s.rawY, s.rawW, s.rawH, s.clientX, s.clientY, s.clientWidth, s.clientHeight, s.outWidth, s.outHeight, s.drawMouse)
 	if err != nil {
 		return
 	}
@@ -269,10 +298,20 @@ func (s *WindowFrameSource) serve() {
 type windowGrabber struct {
 	hwnd uintptr
 
-	windowX   int
-	windowY   int
-	srcWidth  int
-	srcHeight int
+	// rawX/Y/rawW/rawH are the GetWindowRect coordinates. PrintWindow renders
+	// into a DC of rawW×rawH pixels and uses rawX/Y as the on-screen origin,
+	// so all client-area offset arithmetic is relative to these values.
+	rawX int
+	rawY int
+	rawW int
+	rawH int
+
+	// Client rect (content area only, excluding title bar and borders)
+	clientX      int
+	clientY      int
+	clientWidth  int
+	clientHeight int
+
 	outWidth  int
 	outHeight int
 	drawMouse bool
@@ -291,23 +330,27 @@ type windowGrabber struct {
 	frame []byte
 }
 
-func newWindowGrabber(hwnd uintptr, windowX, windowY, srcWidth, srcHeight, outWidth, outHeight int, drawMouse bool) (*windowGrabber, error) {
+func newWindowGrabber(hwnd uintptr, rawX, rawY, rawW, rawH, clientX, clientY, clientWidth, clientHeight, outWidth, outHeight int, drawMouse bool) (*windowGrabber, error) {
 	screenDC, _, _ := procGetDC.Call(0)
 	if screenDC == 0 {
 		return nil, errors.New("GetDC failed for window capture")
 	}
 
 	g := &windowGrabber{
-		hwnd:      hwnd,
-		windowX:   windowX,
-		windowY:   windowY,
-		srcWidth:  srcWidth,
-		srcHeight: srcHeight,
-		outWidth:  outWidth,
-		outHeight: outHeight,
-		drawMouse: drawMouse,
-		screenDC:  screenDC,
-		frame:     make([]byte, outWidth*outHeight*4),
+		hwnd:         hwnd,
+		rawX:         rawX,
+		rawY:         rawY,
+		rawW:         rawW,
+		rawH:         rawH,
+		clientX:      clientX,
+		clientY:      clientY,
+		clientWidth:  clientWidth,
+		clientHeight: clientHeight,
+		outWidth:     outWidth,
+		outHeight:    outHeight,
+		drawMouse:    drawMouse,
+		screenDC:     screenDC,
+		frame:        make([]byte, outWidth*outHeight*4),
 	}
 	cleanup := func() {
 		if g.oldSrc != 0 && g.srcDC != 0 {
@@ -334,7 +377,12 @@ func newWindowGrabber(hwnd uintptr, windowX, windowY, srcWidth, srcHeight, outWi
 	}
 
 	var err error
-	g.srcDC, g.srcBitmap, g.srcBits, g.oldSrc, err = createDIBSection(g.screenDC, srcWidth, srcHeight)
+	// srcDC is sized to rawW×rawH: PrintWindow fills a DC of exactly those
+	// dimensions (it uses the window's actual GetWindowRect size, not the
+	// DWM-trimmed extended frame). Using a smaller DIB here would cause
+	// PrintWindow to render partially outside the buffer, producing grey
+	// borders and cut-off content.
+	g.srcDC, g.srcBitmap, g.srcBits, g.oldSrc, err = createDIBSection(g.screenDC, rawW, rawH)
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -399,7 +447,7 @@ func (g *windowGrabber) grab() ([]byte, error) {
 		if windowDC == 0 {
 			return nil, errors.New("PrintWindow failed")
 		}
-		ok, _, _ := procBitBlt.Call(g.srcDC, 0, 0, uintptr(g.srcWidth), uintptr(g.srcHeight), windowDC, 0, 0, srccopy|captureLayered)
+		ok, _, _ := procBitBlt.Call(g.srcDC, 0, 0, uintptr(g.rawW), uintptr(g.rawH), windowDC, 0, 0, srccopy|captureLayered)
 		procReleaseDC.Call(g.hwnd, windowDC)
 		if ok == 0 {
 			return nil, errors.New("PrintWindow failed")
@@ -407,9 +455,26 @@ func (g *windowGrabber) grab() ([]byte, error) {
 	}
 	procGdiFlush.Call()
 
+	// Calculate the client area offset within the raw window DIB.
+	// clientX/Y are screen coordinates; rawX/Y is the GetWindowRect origin
+	// that PrintWindow uses. The difference is the pixel offset within the
+	// srcDC where the client area starts.
+	clientOffsetX := g.clientX - g.rawX
+	clientOffsetY := g.clientY - g.rawY
+
+	// Use client dimensions for source if available, otherwise fall back to raw
+	srcW := g.clientWidth
+	srcH := g.clientHeight
+	if srcW <= 0 || srcH <= 0 {
+		srcW = g.rawW
+		srcH = g.rawH
+		clientOffsetX = 0
+		clientOffsetY = 0
+	}
+
 	ok, _, _ := procStretchBlt.Call(
 		g.dstDC, 0, 0, uintptr(g.outWidth), uintptr(g.outHeight),
-		g.srcDC, 0, 0, uintptr(g.srcWidth), uintptr(g.srcHeight),
+		g.srcDC, uintptr(clientOffsetX), uintptr(clientOffsetY), uintptr(srcW), uintptr(srcH),
 		srccopy,
 	)
 	if ok == 0 {
@@ -435,6 +500,9 @@ func (g *windowGrabber) grab() ([]byte, error) {
 // returns screen coordinates, so the window's screen origin is subtracted before
 // scaling. The hotspot, not the icon's top-left corner, is what lines up with
 // the pointer position.
+//
+// Since we're capturing only the client area (excluding title bar and borders),
+// the cursor position must be calculated relative to the client area origin.
 func (g *windowGrabber) drawCursor() {
 	if !g.drawMouse {
 		return
@@ -448,9 +516,14 @@ func (g *windowGrabber) drawCursor() {
 	}
 
 	// The window may have moved since the frame source started. Re-read its
-	// visible frame so the pointer stays aligned while the user drags it around.
-	if rect, err := windowFrame(g.hwnd); err == nil {
-		g.windowX, g.windowY = rect.X, rect.Y
+	// raw GetWindowRect so the pointer stays aligned while the user drags it.
+	if rawRect, err := windowGetRect(g.hwnd); err == nil && !rawRect.Empty() {
+		g.rawX, g.rawY = rawRect.X, rawRect.Y
+		// Also update client rect if available
+		if clientRect, err := windowClientRect(g.hwnd); err == nil && !clientRect.Empty() {
+			g.clientX, g.clientY = clientRect.X, clientRect.Y
+			g.clientWidth, g.clientHeight = clientRect.Width, clientRect.Height
+		}
 	}
 
 	icon := winIconInfo{}
@@ -468,15 +541,23 @@ func (g *windowGrabber) drawCursor() {
 	}()
 
 	cursorWidth, cursorHeight := cursorBitmapSize(icon)
+
+	srcW := g.clientWidth
+	srcH := g.clientHeight
+	if srcW <= 0 || srcH <= 0 {
+		srcW = g.rawW
+		srcH = g.rawH
+	}
+
 	x, y, width, height, ok := cursorDrawRect(
-		int(info.PtScreenPos.X)-g.windowX,
-		int(info.PtScreenPos.Y)-g.windowY,
+		int(info.PtScreenPos.X)-g.clientX,
+		int(info.PtScreenPos.Y)-g.clientY,
 		int(icon.XHotspot),
 		int(icon.YHotspot),
 		cursorWidth,
 		cursorHeight,
-		g.srcWidth,
-		g.srcHeight,
+		srcW,
+		srcH,
 		g.outWidth,
 		g.outHeight,
 	)

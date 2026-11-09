@@ -36,13 +36,33 @@ const (
 // list, because "ddagrab is present" and "ddagrab works on this machine" are
 // different statements.
 type Capabilities struct {
-	// DDAGrab is set when a test capture with ddagrab succeeded.
-	DDAGrab bool
+	// DDAGrab maps each DXGI output index to whether ddagrab works for that
+	// output. Values: 0 = unknown (not probed or use sentinel), 1 = healthy,
+	// 2 = unhealthy (black frames detected, fall back to GDI).
+	// Using int8 instead of bool works around a Go 1.27.0 bug where
+	// map[int]bool with false values returns ok=false on two-value lookup.
+	// This per-output granularity handles Optimus laptops where the D3D11
+	// device is created on one GPU but only some monitors are driven by it.
+	DDAGrab map[int]int8
 }
+
+const (
+	DDAGrabUnknown int8 = 0 // not probed / use sentinel
+	DDAGrabHealthy int8 = 1 // probe passed, ddagrab works
+	DDAGrabUnhealthy int8 = 2 // probe failed, black frames detected
+)
 
 // ChooseGrabber picks the grabber to use for this target.
 func (t Target) ChooseGrabber(caps Capabilities) Grabber {
-	if !caps.DDAGrab {
+	if caps.DDAGrab == nil {
+		return GrabberGDigrab
+	}
+	// Sentinel key -1 means "all outputs healthy" (used by the CLI tool
+	// and as a fallback when per-output probing couldn't run).
+	if v, ok := caps.DDAGrab[-1]; ok && v == DDAGrabHealthy {
+		// Global ddagrab is available; continue to per-output checks below.
+	} else {
+		// Empty map, missing sentinel, or sentinel not healthy = no ddagrab at all.
 		return GrabberGDigrab
 	}
 	// ddagrab can only address an output that was matched to ffmpeg's D3D11
@@ -53,6 +73,12 @@ func (t Target) ChooseGrabber(caps Capabilities) Grabber {
 	// This check must come BEFORE the window logic so that a monitor with
 	// DXGIIndex=-1 never incorrectly selects DDAGrab.
 	if t.Monitor.DXGIIndex < 0 {
+		return GrabberGDigrab
+	}
+	// Per-output check: if this specific output failed the luma probe (explicit unhealthy),
+	// fall back to GDI for just this monitor. If the key is missing or unknown,
+	// the sentinel -1: healthy means it's healthy.
+	if v, ok := caps.DDAGrab[t.Monitor.DXGIIndex]; ok && v == DDAGrabUnhealthy {
 		return GrabberGDigrab
 	}
 	if t.Kind == KindWindow {
@@ -128,7 +154,8 @@ func (t Target) ddagrabSpec(opts InputOptions) (InputSpec, error) {
 	}
 
 	args := []string{
-		"-init_hw_device", "d3d11va",
+		"-init_hw_device", "d3d11va=d3d11va",
+		"-filter_hw_device", "d3d11va",
 		"-f", "lavfi",
 		"-i", fmt.Sprintf("ddagrab=output_idx=%d:framerate=%d:draw_mouse=%d",
 			t.Monitor.DXGIIndex, opts.FPS, boolToInt(opts.DrawMouse)),

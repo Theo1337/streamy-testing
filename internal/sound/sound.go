@@ -1,4 +1,4 @@
-// Package sound plays the short cues that mark the start and end of a session.
+// Package sound plays the short cues that mark session and viewer events.
 //
 // The files are embedded so the tray executable keeps working when it is moved
 // on its own, and playback is best effort: a machine without an audio device
@@ -12,14 +12,20 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 //go:embed assets/*.mp3
 var assets embed.FS
 
+const viewerCueGap = time.Second
+
 var (
 	extractMu sync.Mutex
 	extracted = map[string]string{}
+
+	cueMu   sync.Mutex
+	lastCue = map[string]time.Time{}
 )
 
 // PlayStart plays the cue used when a session starts. It returns immediately.
@@ -27,6 +33,36 @@ func PlayStart() { play("start.mp3") }
 
 // PlayStop plays the cue used when a session stops. It returns immediately.
 func PlayStop() { play("stop.mp3") }
+
+// PlayViewerJoined plays the cue used when a viewer starts watching. It returns
+// immediately.
+func PlayViewerJoined() { playViewerCue("join.mp3") }
+
+// PlayViewerLeft plays the cue used when a viewer stops watching. It returns
+// immediately.
+func PlayViewerLeft() { playViewerCue("leave.mp3") }
+
+// playViewerCue collapses a burst of viewer events into one cue. Several people
+// joining at once should sound like a door, not a stutter.
+func playViewerCue(name string) {
+	if !claimCue(name, time.Now()) {
+		return
+	}
+	play(name)
+}
+
+// claimCue reports whether name may play now and records the attempt. It is
+// split out so the coalescing rule can be tested without touching audio
+// hardware.
+func claimCue(name string, now time.Time) bool {
+	cueMu.Lock()
+	defer cueMu.Unlock()
+	if last, ok := lastCue[name]; ok && now.Sub(last) < viewerCueGap {
+		return false
+	}
+	lastCue[name] = now
+	return true
+}
 
 func play(name string) {
 	go func() {

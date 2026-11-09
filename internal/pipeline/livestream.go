@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,11 @@ type LiveStreamer struct {
 	startDone     chan struct{}
 	writer        *io.PipeWriter
 	cfg           config.Config
+
+	// onViewerWatching and onViewerLeft are the app's cues for viewers
+	// arriving and leaving. They are set at Start and cleared at Stop.
+	onViewerWatching func()
+	onViewerLeft     func()
 }
 
 // NewLiveStreamer creates the tray app's browser-sharing pipeline.
@@ -72,14 +78,20 @@ func (s *LiveStreamer) Start(ctx context.Context, req Request) (Session, error) 
 	defer s.finishStart()
 
 	cfg := req.Config
-	if cfg.Signaling.URL == "" {
-		return Session{}, errors.New("signaling.url is empty; configure the Worker WebSocket URL in config.json")
-	}
-	if cfg.Signaling.ViewerURL == "" {
-		return Session{}, errors.New("signaling.viewerURL is empty; configure the deployed viewer URL in config.json")
-	}
-	if req.IdentityToken == "" {
-		return Session{}, errors.New("sign in with Discord from Streamy settings before starting a public stream")
+	relay := cfg.Stream.Relay
+	relayEnabled := relay.Enabled
+	relayOnly := relayEnabled && relay.Only
+
+	if !relayOnly {
+		if cfg.Signaling.ViewerURL == "" {
+			return Session{}, errors.New("signaling.viewerURL is empty; configure the deployed viewer URL in config.json")
+		}
+		if cfg.Signaling.URL == "" {
+			return Session{}, errors.New("signaling.url is empty; configure the Worker WebSocket URL in config.json")
+		}
+		if req.IdentityToken == "" {
+			return Session{}, errors.New("sign in with Discord from Streamy settings before starting a public stream")
+		}
 	}
 
 	// The outputs and capture live beyond the Start call. Detach cancellation
@@ -92,30 +104,99 @@ func (s *LiveStreamer) Start(ctx context.Context, req Request) (Session, error) 
 		}
 	}()
 
-	room, token, err := signal.NewRoom()
-	if err != nil {
-		return Session{}, err
-	}
-	lobbyICEServers := signalingICEServers(cfg)
-	client, err := signal.NewWebSocketWithIdentity(
-		ctx, cfg.Signaling.URL, room, token, req.IdentityToken, cfg.Stream.MaxViewers, lobbyICEServers,
+	// A relay-only stream has no public viewer link, so there is nothing to
+	// build or to post to Discord.
+	var (
+		viewerURL string
+		err       error
 	)
-	if err != nil {
-		return Session{}, err
-	}
-	broadcaster, err := rtc.NewBroadcaster(s.logger)
-	if err != nil {
-		_ = client.Close()
-		return Session{}, err
-	}
-	viewerURL, err := signal.LobbyLink(cfg.Signaling.ViewerURL)
-	if err != nil {
-		broadcaster.Close()
-		_ = client.Close()
-		return Session{}, err
+	if !relayOnly {
+		viewerURL, err = signal.LobbyLink(cfg.Signaling.ViewerURL)
+		if err != nil {
+			return Session{}, err
+		}
 	}
 
-	outputs := []output.Output{output.NewWebRtcOutput(broadcaster)}
+	// Discord Activity uses a fixed channel as the relay room when
+	// ActivityRoom is configured. Otherwise, resolve the streamer's voice
+	// channel (falling back to ChannelID). This allows the Activity to work
+	// from any channel while all viewers join the same shared room.
+	relayRoom := strings.TrimSpace(relay.ChannelID)
+	if relayEnabled && strings.TrimSpace(relay.ActivityRoom) != "" {
+		// Use the fixed activity room directly - no voice channel resolution needed.
+		relayRoom = strings.TrimSpace(relay.ActivityRoom)
+		s.logger.Info("using fixed Discord Activity room", "channel", relayRoom)
+	} else if relayEnabled && strings.TrimSpace(relay.NotifyURL) != "" && strings.TrimSpace(req.UserID) != "" {
+		resolveCtx, resolveCancel := context.WithTimeout(ctx, 10*time.Second)
+		resolved, resolveErr := output.NotifyBotResolve(
+			resolveCtx, relay.NotifyURL, relay.NotifyKey, relay.ChannelID, req.UserID,
+		)
+		resolveCancel()
+		if resolveErr != nil {
+			s.logger.Warn("could not resolve the Discord Activity voice channel", "error", resolveErr)
+		} else if resolved.OK && strings.TrimSpace(resolved.ChannelID) != "" {
+			relayRoom = strings.TrimSpace(resolved.ChannelID)
+			s.logger.Info("resolved Discord Activity channel",
+				"channel", relayRoom, "voice", resolved.Voice)
+		}
+	}
+
+	var room string
+	var client signal.Signaler
+	var broadcaster *rtc.Broadcaster
+	if !relayOnly {
+		var token string
+		var roomErr error
+		room, token, roomErr = signal.NewRoom()
+		if roomErr != nil {
+			return Session{}, roomErr
+		}
+		lobbyICEServers := signalingICEServers(cfg)
+		client, err = signal.NewWebSocketWithIdentity(
+			ctx, cfg.Signaling.URL, room, token, req.IdentityToken, cfg.Stream.MaxViewers, lobbyICEServers,
+		)
+		if err != nil {
+			return Session{}, err
+		}
+		broadcaster, err = rtc.NewBroadcaster(s.logger)
+		if err != nil {
+			_ = client.Close()
+			return Session{}, err
+		}
+	} else {
+		room = relayRoom
+	}
+
+	outputs := make([]output.Output, 0, 2)
+	if broadcaster != nil {
+		outputs = append(outputs, output.NewWebRtcOutput(broadcaster))
+	}
+
+	// Add the WebSocket output for Discord Activity. A relay-only stream has
+	// no WebRTC output at all, so this is the only media path.
+	if relayEnabled && relayRoom != "" && strings.TrimSpace(relay.URL) != "" && strings.TrimSpace(relay.Token) != "" {
+		wsOut, wsErr := output.NewWebSocketOutput(runCtx, output.WebSocketOptions{
+			Endpoint: relay.URL,
+			Room:     relayRoom,
+			Token:    relay.Token,
+			Logger:   s.logger,
+		})
+		if wsErr != nil {
+			s.logger.Warn("could not create Discord Activity relay output", "error", wsErr)
+		} else {
+			outputs = append(outputs, wsOut)
+		}
+	}
+	if len(outputs) == 0 {
+		if broadcaster != nil {
+			broadcaster.Close()
+		}
+		if client != nil {
+			_ = client.Close()
+		}
+		return Session{}, errors.New("no stream output is available; enable WebRTC or configure stream.relay")
+	}
+
 	closeOutputs := func() {
 		for _, out := range outputs {
 			_ = out.Close()
@@ -131,6 +212,9 @@ func (s *LiveStreamer) Start(ctx context.Context, req Request) (Session, error) 
 	cleanupStart := func() {
 		cancel()
 		closeOutputs()
+		if broadcaster != nil {
+			broadcaster.Close()
+		}
 		if client != nil {
 			_ = client.Close()
 		}
@@ -207,6 +291,10 @@ func (s *LiveStreamer) Start(ctx context.Context, req Request) (Session, error) 
 		Description: fmt.Sprintf("%s; viewer link copied to clipboard", captureSession.Description),
 		Target:      captureSession.Target,
 	}
+	if relayOnly {
+		session.Label = "Discord Activity"
+		session.Description = fmt.Sprintf("%s; streaming to Discord Activity", captureSession.Description)
+	}
 	done := make(chan struct{})
 
 	s.mu.Lock()
@@ -223,28 +311,49 @@ func (s *LiveStreamer) Start(ctx context.Context, req Request) (Session, error) 
 	s.identityToken = req.IdentityToken
 	s.writer = writer
 	s.cfg = cfg
+	s.onViewerWatching = req.OnViewerWatching
+	s.onViewerLeft = req.OnViewerLeft
 	s.mu.Unlock()
 
 	go s.forwardVideo(runCtx, reader)
-	go s.handleSignals(runCtx, client, cfg, signalingICEServers(cfg))
+	if client != nil {
+		go s.handleSignals(runCtx, client, cfg, signalingICEServers(cfg))
+	}
+
+	// Notify the Discord bot. The Activity itself is launched by the /watch
+	// command; this message is only the plain viewer link in the configured
+	// text channel. The resolved voice channel is not text-based, so it must
+	// not be used as the notification target.
 	discord := cfg.Stream.Discord
-	if discord.NotifyURL != "" {
+	notifyURL := discord.NotifyURL
+	notifyKey := discord.NotifyKey
+	notifyChannelID := discord.ChannelID
+	if relayEnabled && relay.NotifyURL != "" {
+		notifyURL = relay.NotifyURL
+		notifyKey = relay.NotifyKey
+		notifyChannelID = relay.ChannelID
+	}
+	if !relayOnly && notifyURL != "" && strings.TrimSpace(notifyChannelID) != "" {
 		go func() {
-			notifyCtx, notifyCancel := context.WithTimeout(runCtx, 10*time.Second)
+			notifyCtx, notifyCancel := context.WithTimeout(runCtx, 15*time.Second)
 			defer notifyCancel()
-			err := output.NotifyBotStart(notifyCtx, discord.NotifyURL, discord.NotifyKey, output.BotNotice{
-				ChannelID: discord.ChannelID,
+			err := output.NotifyBotStart(notifyCtx, notifyURL, notifyKey, output.BotNotice{
+				ChannelID: notifyChannelID,
 				Streamer:  req.UserName,
 				URL:       viewerURL,
 			})
 			if err != nil {
 				s.logger.Warn("could not notify the Discord bot", "error", err)
 			} else {
-				s.logger.Info("notified the Discord bot", "channel", discord.ChannelID)
+				s.logger.Info("notified the Discord bot", "channel", notifyChannelID)
 			}
 		}()
 	}
-	s.logger.Info("live room ready", "room", room, "maxViewers", cfg.Stream.MaxViewers)
+	if relayEnabled {
+		s.logger.Info("live room ready", "room", room, "activity_room", relayRoom, "maxViewers", cfg.Stream.MaxViewers)
+	} else {
+		s.logger.Info("live room ready", "room", room, "maxViewers", cfg.Stream.MaxViewers)
+	}
 	running = true
 	return session, nil
 }
@@ -266,11 +375,27 @@ func (s *LiveStreamer) forwardVideo(ctx context.Context, input io.Reader) {
 	var lastBandwidthLog time.Time
 	var bytesSinceLog int64
 
+	// Stall detection: if no access unit arrives within 5s of capture start,
+	// log ffmpeg stderr tail so the black-screen failure mode is visible.
+	firstFrameDeadline := time.NewTimer(5 * time.Second)
+	defer firstFrameDeadline.Stop()
+	firstFrameReceived := false
+
 	for {
 		select {
 		case <-ctx.Done():
 			_ = reader.Drain()
 			return
+		case <-firstFrameDeadline.C:
+			if !firstFrameReceived {
+				s.mu.Lock()
+				recorder := s.recorder
+				s.mu.Unlock()
+				if recorder != nil {
+					s.logger.Error("no video frames received within 5s of capture start; ffmpeg stderr tail",
+						"stderr", recorder.FFmpegStderr())
+				}
+			}
 		default:
 		}
 		accessUnit, err := reader.Next()
@@ -287,6 +412,12 @@ func (s *LiveStreamer) forwardVideo(ctx context.Context, input io.Reader) {
 			}
 			s.logger.Error("could not parse ffmpeg H.264 output", "error", err)
 			return
+		}
+
+		if !firstFrameReceived {
+			firstFrameReceived = true
+			firstFrameDeadline.Stop()
+			s.logger.Info("first video frame received", "bytes", len(accessUnit))
 		}
 
 		s.mu.Lock()
@@ -418,7 +549,14 @@ func (s *LiveStreamer) consumeSignals(ctx context.Context, client signal.Signale
 					broadcaster := s.broadcast
 					s.mu.Unlock()
 					if broadcaster != nil {
+						// Only viewers that actually saw video deserve a
+						// goodbye cue; a page that opened and closed without
+						// negotiating never chimed in the first place.
+						watching := broadcaster.Peer(message.PeerID).WasConnected()
 						broadcaster.RemovePeer(message.PeerID)
+						if watching {
+							s.notifyViewerLeft()
+						}
 					}
 					s.logger.Info("viewer left", "peer_id", message.PeerID, "reason", message.Reason)
 				}
@@ -484,6 +622,7 @@ func (s *LiveStreamer) startViewer(ctx context.Context, client signal.Signaler, 
 	}
 
 	s.logger.Info("sent WebRTC offer", "peer_id", peerID)
+	go s.watchViewer(ctx, peerID, peer)
 	go func() {
 		select {
 		case err := <-peer.Failure():
@@ -495,6 +634,36 @@ func (s *LiveStreamer) startViewer(ctx context.Context, client signal.Signaler, 
 		case <-ctx.Done():
 		}
 	}()
+}
+
+// watchViewer waits for one viewer's media path to come up. Signaling says a
+// page connected; this says a person is actually watching.
+func (s *LiveStreamer) watchViewer(ctx context.Context, peerID string, peer *rtc.Peer) {
+	select {
+	case <-peer.Connected():
+		s.mu.Lock()
+		notify := s.onViewerWatching
+		broadcaster := s.broadcast
+		s.mu.Unlock()
+		if notify == nil || broadcaster == nil || broadcaster.Peer(peerID) != peer {
+			// The viewer left before the connection event was handled, so
+			// the departure cue already told the story.
+			return
+		}
+		s.logger.Info("viewer is watching", "peer_id", peerID)
+		notify()
+	case <-ctx.Done():
+	}
+}
+
+// notifyViewerLeft runs the viewer-left cue away from the signaling read loop.
+func (s *LiveStreamer) notifyViewerLeft() {
+	s.mu.Lock()
+	notify := s.onViewerLeft
+	s.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
 }
 
 func iceServers(cfg config.Config) []webrtc.ICEServer {
@@ -568,6 +737,7 @@ func (s *LiveStreamer) Stop(ctx context.Context) error {
 	s.recorder, s.audio, s.signal, s.broadcast, s.outputs = nil, nil, nil, nil, nil
 	s.cancel, s.reader, s.done, s.session, s.fps = nil, nil, nil, Session{}, 0
 	s.writer = nil
+	s.onViewerWatching, s.onViewerLeft = nil, nil
 	s.mu.Unlock()
 	if recorder == nil {
 		return nil
@@ -584,29 +754,22 @@ func (s *LiveStreamer) Stop(ctx context.Context) error {
 		}
 	}
 	err := recorder.Stop(ctx)
-	// Wait for the video pump to finish. recorder.Stop() stops ffmpeg, which
-	// closes its stdout (our writer), so forwardVideo will see io.EOF and exit
-	// cleanly. We wait for 'done' before closing the writer ourselves as a
-	// safety net; if we closed the writer first, forwardVideo would get
-	// io.ErrClosedPipe instead of EOF and log a spurious parse error.
+	// Close writer so forwardVideo sees io.EOF and exits promptly without
+	// hanging until ctx.Done().
+	if writer != nil {
+		_ = writer.Close()
+	}
 	if done != nil {
 		select {
 		case <-done:
 		case <-ctx.Done():
 			err = errors.Join(err, ctx.Err())
 			// Context deadline fired: force-unblock the pump by closing the
-			// reader so it returns io.ErrClosedPipe (which forwardVideo treats
-			// as a clean shutdown because ctx.Err() is set).
+			// reader so it returns io.ErrClosedPipe.
 			if reader != nil {
 				_ = reader.Close()
 			}
 		}
-	}
-	// Safety net: if recorder.Stop() didn't close the writer (e.g. ffmpeg
-	// already exited), close it now. forwardVideo has already exited, so this
-	// is a no-op for the pump.
-	if writer != nil {
-		_ = writer.Close()
 	}
 	if reader != nil {
 		_ = reader.Close()
@@ -617,6 +780,17 @@ func (s *LiveStreamer) Stop(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+// ViewerCount returns the current number of connected viewers.
+func (s *LiveStreamer) ViewerCount() int {
+	s.mu.Lock()
+	broadcaster := s.broadcast
+	s.mu.Unlock()
+	if broadcaster == nil {
+		return 0
+	}
+	return broadcaster.ViewerCount()
 }
 
 var _ Streamer = (*LiveStreamer)(nil)

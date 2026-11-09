@@ -10,7 +10,7 @@ package version
 // That is why they are variables and not constants: the linker can only
 // rewrite variables.
 var (
-	Version = "0.1.0-dev"
+	Version = "0.99.0-dev"
 	Commit  = "unknown"
 	Date    = "unknown"
 )

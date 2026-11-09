@@ -19,6 +19,7 @@ import (
 
 	"streamy/internal/capture"
 	"streamy/internal/config"
+	"streamy/internal/update"
 )
 
 const maxIPCRequestBytes = 1 << 20
@@ -74,6 +75,9 @@ func (a *App) startIPC() error {
 	mux.HandleFunc("GET /api/targets", a.ipcTargets)
 	mux.HandleFunc("GET /api/preview", a.ipcPreview)
 	mux.HandleFunc("GET /api/status", a.ipcStatus)
+	mux.HandleFunc("GET /api/update", a.ipcUpdate)
+	mux.HandleFunc("POST /api/check-updates", a.ipcCheckUpdates)
+	mux.HandleFunc("POST /api/install-update", a.ipcInstallUpdate)
 	mux.HandleFunc("POST /api/share", a.ipcShare)
 	mux.HandleFunc("POST /api/switch", a.ipcSwitch)
 	mux.HandleFunc("POST /api/startup", a.ipcStartup)
@@ -209,6 +213,94 @@ func pngDataURL(data []byte) string {
 
 func (a *App) ipcStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, a.Status())
+}
+
+func (a *App) ipcUpdate(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	phase := a.updatePhase
+	progress := a.updateProgress
+	total := a.updateTotal
+	version := a.pendingUpdateVersion
+	required := a.updateRequired
+	errMessage := a.updateError
+	installing := a.updateInstalling
+	a.mu.Unlock()
+
+	terminal := phase == updateComplete || phase == updateFailed || phase == updateRestarting
+	writeJSON(w, map[string]any{
+		// Keep the old fields for older UI builds while exposing the complete
+		// lifecycle to the dedicated update view.
+		"progress":   progress,
+		"total":      total,
+		"installing": installing,
+		"version":    version,
+		"required":   required,
+		"phase":      phase,
+		"error":      errMessage,
+		"terminal":   terminal,
+		"complete":   phase == updateComplete || phase == updateRestarting,
+		"failed":     phase == updateFailed,
+	})
+}
+
+func (a *App) ipcCheckUpdates(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	configured := a.updateChecker != nil
+	a.mu.Unlock()
+
+	if !configured {
+		http.Error(w, "Update check unavailable: auto-update is not configured. Set a GitHub repo in settings to enable.", http.StatusServiceUnavailable)
+		return
+	}
+
+	// CheckForUpdates owns its goroutine and the in-flight guard. Do not wrap it
+	// in another goroutine: doing so used to make manual checks race each other.
+	a.CheckForUpdates()
+
+	// Return the current update state so the caller can poll /api/update for progress.
+	a.mu.Lock()
+	phase := a.updatePhase
+	progress := a.updateProgress
+	total := a.updateTotal
+	version := a.pendingUpdateVersion
+	required := a.updateRequired
+	errMessage := a.updateError
+	installing := a.updateInstalling
+	a.mu.Unlock()
+
+	terminal := phase == updateComplete || phase == updateFailed || phase == updateRestarting
+	writeJSON(w, map[string]any{
+		"started":    true,
+		"phase":      phase,
+		"progress":   progress,
+		"total":      total,
+		"version":    version,
+		"required":   required,
+		"error":      errMessage,
+		"installing": installing,
+		"terminal":   terminal,
+		"complete":   phase == updateComplete || phase == updateRestarting,
+		"failed":     phase == updateFailed,
+	})
+}
+
+func (a *App) ipcInstallUpdate(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	ready := a.pendingUpdateFile != ""
+	inFlight := a.updateInFlight
+	a.mu.Unlock()
+	if !ready && !inFlight {
+		http.Error(w, "No update is downloading or ready", http.StatusBadRequest)
+		return
+	}
+
+	// Compatibility endpoint only. The automatic lifecycle normally reaches this
+	// method without any UI click; claiming is atomic and repeated calls are safe.
+	a.tryStartUpdateInstall()
+	a.mu.Lock()
+	phase := a.updatePhase
+	a.mu.Unlock()
+	writeJSON(w, map[string]any{"started": true, "phase": phase})
 }
 
 func (a *App) ipcPreview(w http.ResponseWriter, r *http.Request) {
@@ -377,8 +469,47 @@ func (a *App) saveConfig(cfg config.Config) error {
 	}
 	a.mu.Lock()
 	a.cfg, a.cfgPath = cfg, path
+
+	// Cancel any in-flight update if updates are now disabled or repo changed.
+	// This prevents an ongoing check/download from installing an unwanted version.
+	updateDisabled := !cfg.Update.Enabled || strings.TrimSpace(cfg.Update.Repo) == ""
+	repoChanged := old.Update.Repo != cfg.Update.Repo
+	autoUpdateDisabledChanged := old.Update.AutoUpdateDisabled != cfg.Update.AutoUpdateDisabled
+	if updateDisabled || repoChanged || autoUpdateDisabledChanged {
+		if a.updateInFlight {
+			a.logger.Info("cancelling in-flight update due to settings change",
+				"updateDisabled", updateDisabled, "repoChanged", repoChanged, "autoUpdateDisabledChanged", autoUpdateDisabledChanged)
+			// If a download is in progress, the context cancellation will stop it.
+			// Clear pending state so no stray installer is left.
+			a.pendingUpdateFile = ""
+			a.pendingUpdateURL = ""
+			a.pendingUpdateVersion = ""
+			a.updateProgress = 0
+			a.updateTotal = 0
+			a.updateRequired = false
+			a.updateInstallClaimed = false
+			a.updateInstalling = false
+			a.updateInFlight = false
+			a.updatePhase = updateIdle
+			a.updateError = ""
+		}
+	}
+
+	if cfg.Update.Enabled && strings.TrimSpace(cfg.Update.Repo) != "" {
+		if a.updateChecker == nil || old.Update.Repo != cfg.Update.Repo {
+			a.updateChecker = update.NewChecker(cfg.Update.Repo)
+		}
+	} else {
+		a.updateChecker = nil
+	}
+	checkNow := cfg.Update.Enabled && strings.TrimSpace(cfg.Update.Repo) != "" &&
+		(!old.Update.Enabled || old.Update.Repo != cfg.Update.Repo || old.Update.AutoUpdateDisabled != cfg.Update.AutoUpdateDisabled)
 	a.mu.Unlock()
 	a.logger.Info("settings updated", "config", path)
+	a.syncLiveIndicator()
+	if checkNow {
+		go a.performUpdateCheck(cfg.Update.AutoUpdateDisabled)
+	}
 	return nil
 }
 

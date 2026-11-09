@@ -30,6 +30,8 @@ var (
 	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procGetWindowRect       = user32.NewProc("GetWindowRect")
+	procGetClientRect       = user32.NewProc("GetClientRect")
+	procClientToScreen      = user32.NewProc("ClientToScreen")
 	procGetWindowTextW      = user32.NewProc("GetWindowTextW")
 	procGetClassNameW       = user32.NewProc("GetClassNameW")
 	procIsIconic            = user32.NewProc("IsIconic")

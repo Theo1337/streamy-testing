@@ -21,6 +21,9 @@ func TestDefaultIsValid(t *testing.T) {
 	if !Default().Capture.ExcludeDiscordAudio {
 		t.Fatal("Discord audio should be excluded by default")
 	}
+	if !Default().Indicator.Enabled || Default().Indicator.Position != IndicatorTopRight {
+		t.Fatalf("indicator defaults = %+v, want an enabled top right dot", Default().Indicator)
+	}
 }
 
 func TestLoadFromWritesDefaultsWhenMissing(t *testing.T) {
@@ -53,7 +56,7 @@ func TestLoadFromToleratesAByteOrderMark(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.json")
-			body := `{"logLevel":"debug","encoding":{"fps":24},"capture":{"defaultTarget":"mouse"}}`
+			body := `{"logLevel":"debug","encoding":{"fps":24},"capture":{"defaultTarget":"primary"}}`
 			if err := os.WriteFile(path, []byte(tc.prefix+body), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -66,8 +69,8 @@ func TestLoadFromToleratesAByteOrderMark(t *testing.T) {
 				t.Errorf("logLevel = %q, fps = %d; want \"debug\" and 24 from the file",
 					cfg.LogLevel, cfg.Encoding.FPS)
 			}
-			if cfg.Capture.DefaultTarget != TargetMouse {
-				t.Errorf("capture.defaultTarget = %q, want %q", cfg.Capture.DefaultTarget, TargetMouse)
+			if cfg.Capture.DefaultTarget != TargetPrimary {
+				t.Errorf("capture.defaultTarget = %q, want %q", cfg.Capture.DefaultTarget, TargetPrimary)
 			}
 			if !cfg.Capture.DesktopAudio {
 				t.Error("missing capture.desktopAudio should use the enabled default")
@@ -75,8 +78,8 @@ func TestLoadFromToleratesAByteOrderMark(t *testing.T) {
 			if !cfg.Capture.ExcludeDiscordAudio {
 				t.Error("missing capture.excludeDiscordAudio should use the enabled default")
 			}
-			if cfg.SetupComplete || cfg.RunAtStartup {
-				t.Errorf("missing setup/startup settings = %t/%t, want false/false", cfg.SetupComplete, cfg.RunAtStartup)
+			if cfg.SetupComplete || !cfg.RunAtStartup {
+				t.Errorf("missing setup/startup settings = %t/%t, want false/true", cfg.SetupComplete, cfg.RunAtStartup)
 			}
 			if cfg.Signaling.URL != DefaultSignalingURL || cfg.Signaling.ViewerURL != DefaultViewerURL {
 				t.Errorf("missing service endpoints = %+v, want bundled defaults", cfg.Signaling)
@@ -194,13 +197,27 @@ func TestLoadFromMigratesLegacyRelayNotification(t *testing.T) {
 	if created {
 		t.Fatal("LoadFrom reported a created file for an existing config")
 	}
-	want := DiscordBot{
+	wantDiscord := DiscordBot{
 		ChannelID: "123456789012345678",
 		NotifyURL: "http://127.0.0.1:8791/api/notify",
 		NotifyKey: "notify-secret",
 	}
-	if cfg.Stream.Discord != want {
-		t.Fatalf("stream.discord = %+v, want %+v", cfg.Stream.Discord, want)
+	if cfg.Stream.Discord != wantDiscord {
+		t.Fatalf("stream.discord = %+v, want %+v", cfg.Stream.Discord, wantDiscord)
+	}
+	// stream.relay is still the live Activity configuration. The custom
+	// Stream.UnmarshalJSON must not consume it only to migrate notifications.
+	wantRelay := Relay{
+		Enabled:   true,
+		URL:       "wss://relay.example.com",
+		Token:     "publisher-secret",
+		ChannelID: "123456789012345678",
+		Only:      true,
+		NotifyURL: "http://127.0.0.1:8791/api/notify",
+		NotifyKey: "notify-secret",
+	}
+	if cfg.Stream.Relay != wantRelay {
+		t.Fatalf("stream.relay = %+v, want %+v", cfg.Stream.Relay, wantRelay)
 	}
 }
 
@@ -268,6 +285,8 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"invalid STUN URL", func(c *Config) { c.Stream.STUNServers = []string{"turn:relay.example"} }},
 		{"invalid TURN URL", func(c *Config) { c.Stream.TURNServers = []TURNServer{{URLs: []string{"stun:stun.example"}}} }},
 		{"bad default target", func(c *Config) { c.Capture.DefaultTarget = "everything" }},
+		{"bad indicator position", func(c *Config) { c.Indicator.Position = "middle" }},
+		{"empty indicator position", func(c *Config) { c.Indicator.Position = "" }},
 		{"bad log level", func(c *Config) { c.LogLevel = "verbose" }},
 		{"signaling without scheme", func(c *Config) { c.Signaling.URL = "example.com" }},
 		{"signaling with http", func(c *Config) { c.Signaling.URL = "https://example.com" }},
@@ -302,6 +321,7 @@ func TestValidateAcceptsGoodValues(t *testing.T) {
 	cfg.Signaling.URL = "wss://streamy-signal.example.workers.dev"
 	cfg.Signaling.ViewerURL = "https://streamy-viewer.pages.dev/"
 	cfg.Stream.MaxViewers = 0 // unlimited
+	cfg.Indicator.Position = IndicatorBottomLeft
 	cfg.Stream.Discord = DiscordBot{
 		ChannelID: "123456789012345678",
 		NotifyURL: "https://bot.example.com/api/notify",

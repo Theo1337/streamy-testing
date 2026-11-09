@@ -13,11 +13,14 @@ import (
 
 // BotNotice is the payload the bot uses to post or remove the live viewer link.
 // Action is "start" or "stop"; an empty action means start.
+// For Discord Activity, "resolve" asks the bot to find the channel from the user's
+// voice state and returns the channel ID.
 type BotNotice struct {
 	Action    string `json:"action,omitempty"`
 	ChannelID string `json:"channelId"`
 	Streamer  string `json:"streamer,omitempty"`
 	URL       string `json:"url,omitempty"`
+	UserID    string `json:"userId,omitempty"`
 }
 
 // NotifyBotStart tells the bot to post the public viewer link. The API key is a
@@ -34,6 +37,33 @@ func NotifyBotStop(ctx context.Context, endpoint, apiKey string, notice BotNotic
 	notice.Action = "stop"
 	_, err := callBot(ctx, endpoint, apiKey, notice)
 	return err
+}
+
+// ResolveResponse is the response from the bot's resolve action.
+type ResolveResponse struct {
+	OK       bool   `json:"ok"`
+	ChannelID string `json:"channelId"`
+	Voice    bool   `json:"voice"`
+}
+
+// NotifyBotResolve asks the bot to find the target channel from the user's voice
+// state. Returns the channel ID and whether it's a voice channel.
+func NotifyBotResolve(ctx context.Context, endpoint, apiKey string, channelID, userID string) (ResolveResponse, error) {
+	var zero ResolveResponse
+	notice := BotNotice{
+		Action:    "resolve",
+		ChannelID: channelID,
+		UserID:    userID,
+	}
+	body, err := callBot(ctx, endpoint, apiKey, notice)
+	if err != nil {
+		return zero, err
+	}
+	var resp ResolveResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return zero, fmt.Errorf("parse resolve response: %w", err)
+	}
+	return resp, nil
 }
 
 func callBot(ctx context.Context, endpoint, apiKey string, notice BotNotice) ([]byte, error) {

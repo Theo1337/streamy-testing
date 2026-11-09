@@ -109,12 +109,12 @@ func Preview(ctx context.Context, target Target, maxWidth, maxHeight int) ([]byt
 		captured = result != 0
 	}
 	if !captured {
-		result, _, _ := procBitBlt.Call(
+		result, _, err := procBitBlt.Call(
 			sourceDC, 0, 0, uintptr(source.Width), uintptr(source.Height),
 			screenDC, uintptr(int64(source.X)), uintptr(int64(source.Y)), srccopy|captureLayered,
 		)
 		if result == 0 {
-			return nil, errors.New("BitBlt failed while capturing preview")
+			return nil, fmt.Errorf("BitBlt failed while capturing preview: %w", err)
 		}
 	}
 

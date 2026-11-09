@@ -50,7 +50,6 @@ const legacyViewerHost = "master.streamy-viewer.pages.dev"
 // The values accepted by Capture.DefaultTarget.
 const (
 	TargetPrimary = "primary" // the primary monitor
-	TargetMouse   = "mouse"   // the monitor under the mouse cursor
 	TargetFocused = "focused" // whatever window currently has focus
 	TargetMonitor = "monitor" // the monitor at Capture.MonitorIndex
 )
@@ -75,6 +74,7 @@ type Config struct {
 
 	Hotkey    Hotkey    `json:"hotkey"`
 	Capture   Capture   `json:"capture"`
+	Indicator Indicator `json:"indicator"`
 	Encoding  Encoding  `json:"encoding"`
 	Stream    Stream    `json:"stream"`
 	Signaling Signaling `json:"signaling"`
@@ -91,6 +91,25 @@ type Hotkey struct {
 	Picker string `json:"picker"`
 }
 
+// The values accepted by Indicator.Position.
+const (
+	IndicatorTopLeft     = "top-left"
+	IndicatorTopRight    = "top-right"
+	IndicatorBottomLeft  = "bottom-left"
+	IndicatorBottomRight = "bottom-right"
+)
+
+// Indicator configures the small blinking red dot shown on the streamer's own
+// screen while a stream is live. It is always on top and stays out of the
+// capture, so viewers never see it.
+type Indicator struct {
+	Enabled         bool `json:"enabled"`
+	// Position is one of the Indicator* constants above.
+	Position        string `json:"position"`
+	// ShowViewerCount displays the number of viewers next to the live dot.
+	ShowViewerCount bool `json:"showViewerCount"`
+}
+
 // Capture holds the "what do we record" settings, including the automatic
 // target selection rules described in INSTRUCTIONS.md.
 type Capture struct {
@@ -100,11 +119,6 @@ type Capture struct {
 	MonitorIndex int `json:"monitorIndex"`
 	// AlwaysShowPicker disables auto-selection entirely.
 	AlwaysShowPicker bool `json:"alwaysShowPicker"`
-	// AutoSwitchTarget follows the fullscreen app while streaming. Off by
-	// default because switching targets restarts the encoder.
-	AutoSwitchTarget bool `json:"autoSwitchTarget"`
-	// CaptureCursor draws the mouse pointer into the video.
-	CaptureCursor bool `json:"captureCursor"`
 	// DesktopAudio captures system render audio, including all apps
 	// routed to that device. When ExcludeDiscordAudio is enabled, Windows
 	// process loopback excludes the Discord desktop client's process tree.
@@ -132,15 +146,60 @@ type Encoding struct {
 	ExtraEncoderArgs []string `json:"extraEncoderArgs"`
 }
 
-// Stream holds the WebRTC settings and the optional Discord bot notification.
+// Stream holds the WebRTC settings, the optional Discord Activity relay and
+// the optional Discord bot notification.
 type Stream struct {
 	MaxViewers  int          `json:"maxViewers"`
 	STUNServers []string     `json:"stunServers"`
 	TURNServers []TURNServer `json:"turnServers"`
 	// Discord configures the local bot that posts the public viewer link.
 	Discord DiscordBot `json:"discord"`
-	// Stack controls the local Discord bot process.
+	// Relay is the optional Discord Activity WebSocket output. It can run
+	// alongside WebRTC or replace it entirely.
+	Relay Relay `json:"relay"`
+	// Stack controls the local bot/relay/gateway/tunnel process.
 	Stack LocalBot `json:"stack"`
+}
+
+// Relay configures the publisher side of the Activity relay.
+type Relay struct {
+	// Enabled turns the WebSocket output on.
+	Enabled bool `json:"enabled"`
+	// URL is the relay base URL, e.g. wss://relay.example.com.
+	URL string `json:"url"`
+	// Token is the relay's deployment-wide publisher secret.
+	Token string `json:"token"`
+	// ChannelID is the fallback Discord channel whose Activity should share
+	// this stream. When the streamer is in a voice channel, the bot resolves
+	// that voice channel instead. The relay room ID is exactly the resolved
+	// channel ID, so viewers in that channel's Activity join the same room.
+	ChannelID string `json:"channelID"`
+	// ActivityRoom is a fixed Discord channel ID to use as the Activity relay
+	// room. When set, the desktop app publishes to this room directly instead
+	// of resolving the streamer's voice channel. This allows the Activity to
+	// work from any channel while all viewers join the same shared room.
+	// If empty, the voice channel resolution is used (falling back to ChannelID).
+	ActivityRoom string `json:"activityRoom"`
+	// Only skips Cloudflare signaling and WebRTC entirely. Useful for a
+	// Discord-only deployment.
+	Only bool `json:"only"`
+	// Cloudflared enables automatic Cloudflare tunnel (cloudflared) for the
+	// Activity stack. When true, the Activity stack starts cloudflared and
+	// registers the tunnel URL with the bot so the viewer link is public HTTPS.
+	Cloudflared bool `json:"cloudflared"`
+	// NotifyURL and NotifyKey let the bot post a Watch message when a stream
+	// starts. Leave NotifyURL empty to disable notifications.
+	NotifyURL string `json:"notifyURL"`
+	NotifyKey string `json:"notifyKey"`
+	// DiscordClientID is the Discord Application (Client) ID for the Activity OAuth flow.
+	// If empty, it will be read from the viewer's config.json.
+	DiscordClientID string `json:"discordClientID"`
+	// DiscordClientSecret is the Discord Application secret for the Activity OAuth flow.
+	// This must be obtained from the Discord Developer Portal.
+	DiscordClientSecret string `json:"discordClientSecret"`
+	// IdentitySecret is the HMAC secret for signing identity tokens (min 32 chars).
+	// If empty, a random secret will be generated and saved on first run.
+	IdentitySecret string `json:"identitySecret"`
 }
 
 // DiscordBot configures the local bot notification.
@@ -153,33 +212,49 @@ type DiscordBot struct {
 	NotifyKey string `json:"notifyKey"`
 }
 
-// LocalBot configures the local Discord bot launcher.
+// LocalBot configures the local Discord bot/Activity stack launcher.
 //
 // The desktop app runs the built-in `streamy bot` subcommand when Script is
-// empty, and stops it again on quit.
+// empty, and stops it again on quit. When the Activity relay is enabled, Script
+// can point at start-activity.ps1 (development) or start-stack.ps1 (installed),
+// which starts the relay, bot, gateway and Cloudflare tunnel together.
 type LocalBot struct {
-	// AutoStart launches the bot together with Streamy.
+	// AutoStart launches the bot/stack together with Streamy.
 	AutoStart bool `json:"autoStart"`
-	// Script is an explicit path to a legacy start-bot.ps1. Empty means use
-	// the built-in Go bot.
+	// Script is an explicit path to a launcher script. Empty means use the
+	// built-in Go bot, or auto-detect an Activity stack script.
 	Script string `json:"script"`
+	// PublishToken is passed to the relay as its publisher secret.
+	PublishToken string `json:"publishToken"`
 }
 
-// UnmarshalJSON also reads the old stream.relay notification block. Earlier
-// versions used that object for the Activity relay publisher; only the bot
-// notification fields were kept, so importing them silently upgrades a config.
+// UnmarshalJSON reads the Activity relay block that older configs stored under
+// stream.relay. The same object is still valid today, but it used to be the
+// only notification configuration, so a config with stream.discord empty also
+// inherits its notify fields.
 func (s *Stream) UnmarshalJSON(data []byte) error {
 	type streamJSON Stream
 	var raw struct {
 		*streamJSON
-		LegacyRelay *DiscordBot `json:"relay"`
+		LegacyRelay *Relay `json:"relay"`
 	}
 	raw.streamJSON = (*streamJSON)(s)
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	if s.Discord == (DiscordBot{}) && raw.LegacyRelay != nil {
-		s.Discord = *raw.LegacyRelay
+	// The explicit LegacyRelay field above shadows the embedded Relay field for
+	// the "relay" key, so json.Unmarshal fills raw.LegacyRelay and leaves
+	// s.Relay at its zero value. Copy it back: stream.relay is still the live
+	// Activity configuration, not just a source of legacy notify settings.
+	if raw.LegacyRelay != nil {
+		s.Relay = *raw.LegacyRelay
+		if s.Discord == (DiscordBot{}) {
+			s.Discord = DiscordBot{
+				ChannelID: raw.LegacyRelay.ChannelID,
+				NotifyURL: raw.LegacyRelay.NotifyURL,
+				NotifyKey: raw.LegacyRelay.NotifyKey,
+			}
+		}
 	}
 	return nil
 }
@@ -205,14 +280,18 @@ type Update struct {
 	Repo string `json:"repo"`
 	// CheckIntervalDays is how often to check for updates (0 = default 7 days).
 	CheckIntervalDays int `json:"checkIntervalDays"`
+	// AutoUpdateDisabled disables automatic periodic update checks.
+	// If an update is marked as required, it will still notify regardless.
+	AutoUpdateDisabled bool `json:"autoUpdateDisabled"`
 }
 
 // Default returns the settings used on first run, and the base that a loaded
 // file is decoded on top of.
 func Default() Config {
 	return Config{
-		Schema:   CurrentSchema,
-		LogLevel: "info",
+		Schema:       CurrentSchema,
+		LogLevel:     "info",
+		RunAtStartup: true,
 		Hotkey: Hotkey{
 			Enabled: true,
 			Toggle:  "Ctrl+Shift+F9",
@@ -221,9 +300,13 @@ func Default() Config {
 		Capture: Capture{
 			DefaultTarget:       TargetPrimary,
 			MonitorIndex:        0,
-			CaptureCursor:       true,
 			DesktopAudio:        true,
 			ExcludeDiscordAudio: true,
+		},
+		Indicator: Indicator{
+			Enabled:          true,
+			Position:         IndicatorTopRight,
+			ShowViewerCount:  true,
 		},
 		Encoding: Encoding{
 			Encoder:         EncoderAuto,
@@ -240,6 +323,14 @@ func Default() Config {
 				"stun:stun.l.google.com:19302",
 				"stun:stun1.l.google.com:19302",
 			},
+			Relay: Relay{
+				Enabled:    true,
+				Only:       true,
+				URL:        "ws://127.0.0.1:8080/.proxy/relay",
+				Token:      "dev-token",
+				ActivityRoom: "123456789012345678",
+				Cloudflared: true,
+			},
 			Stack: LocalBot{AutoStart: true},
 		},
 		Signaling: Signaling{
@@ -247,9 +338,10 @@ func Default() Config {
 			ViewerURL: DefaultViewerURL,
 		},
 		Update: Update{
-			Enabled:           true,
-			Repo:              "Theo1337/streamy-app",
-			CheckIntervalDays: 7,
+			Enabled:            true,
+			Repo:               "Theo1337/streamy-app",
+			CheckIntervalDays:  1,
+			AutoUpdateDisabled: false,
 		},
 	}
 }
@@ -430,6 +522,11 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("config schema %d is newer than this build understands (%d)", c.Schema, CurrentSchema))
 	}
 
+	// Validate activityRoom is a valid Discord channel ID when set
+	if id := strings.TrimSpace(c.Stream.Relay.ActivityRoom); id != "" && !discordChannelRe.MatchString(id) {
+		errs = append(errs, errors.New("stream.relay.activityRoom: must be a Discord channel ID"))
+	}
+
 	if c.Hotkey.Enabled {
 		if _, err := hotkey.Parse(c.Hotkey.Toggle); err != nil {
 			errs = append(errs, fmt.Errorf("hotkey.toggle: %w", err))
@@ -440,7 +537,7 @@ func (c Config) Validate() error {
 	}
 
 	switch c.Capture.DefaultTarget {
-	case TargetPrimary, TargetMouse, TargetFocused, TargetMonitor:
+	case TargetPrimary, TargetFocused, TargetMonitor:
 	case "":
 		errs = append(errs, errors.New("capture.defaultTarget: must not be empty"))
 	default:
@@ -448,6 +545,14 @@ func (c Config) Validate() error {
 	}
 	if c.Capture.MonitorIndex < 0 {
 		errs = append(errs, errors.New("capture.monitorIndex: must not be negative"))
+	}
+
+	switch c.Indicator.Position {
+	case IndicatorTopLeft, IndicatorTopRight, IndicatorBottomLeft, IndicatorBottomRight:
+	case "":
+		errs = append(errs, errors.New("indicator.position: must not be empty"))
+	default:
+		errs = append(errs, fmt.Errorf("indicator.position: unknown value %q (want top-left, top-right, bottom-left or bottom-right)", c.Indicator.Position))
 	}
 
 	switch c.Encoding.Encoder {
@@ -542,6 +647,38 @@ func (c Config) Validate() error {
 	}
 	if id := strings.TrimSpace(discord.ChannelID); id != "" && !discordChannelRe.MatchString(id) {
 		errs = append(errs, errors.New("stream.discord.channelID: must be a Discord channel ID"))
+	}
+
+	relay := c.Stream.Relay
+	if relay.Only && !relay.Enabled {
+		errs = append(errs, errors.New("stream.relay.only: requires stream.relay.enabled"))
+	}
+	// activityRoom validation moved to the main validation section above
+	if relay.Enabled {
+		if u := strings.TrimSpace(relay.URL); u == "" {
+			errs = append(errs, errors.New("stream.relay.url: required when the relay is enabled"))
+		} else if parsed, err := url.Parse(u); err != nil {
+			errs = append(errs, fmt.Errorf("stream.relay.url: %w", err))
+		} else if (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.Host == "" {
+			errs = append(errs, errors.New("stream.relay.url: must be an absolute ws or wss URL"))
+		}
+		if strings.TrimSpace(relay.Token) == "" {
+			errs = append(errs, errors.New("stream.relay.token: required when the relay is enabled"))
+		}
+	}
+	if id := strings.TrimSpace(relay.ChannelID); id != "" && !discordChannelRe.MatchString(id) {
+		errs = append(errs, errors.New("stream.relay.channelID: must be a Discord channel ID"))
+	}
+	if u := strings.TrimSpace(relay.NotifyURL); u != "" {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stream.relay.notifyURL: %w", err))
+		} else if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			errs = append(errs, errors.New("stream.relay.notifyURL: must be an absolute http or https URL"))
+		}
+		if strings.TrimSpace(relay.NotifyKey) == "" {
+			errs = append(errs, errors.New("stream.relay.notifyKey: required when notifyURL is set"))
+		}
 	}
 
 	return errors.Join(errs...)

@@ -76,6 +76,17 @@ bound only to `127.0.0.1`. The tray itself imports no Wails or frontend runtime.
 The picker can start a specific display/window, and the hotkey settings can
 toggle sharing or open the picker.
 
+### Live indicator
+
+While a stream is live, Streamy can draw a small blinking red dot in one of the
+four corners of the primary display. It is a hand-written layered Win32 window
+(`internal/liveindicator`): always on top, click-through, never takes focus, and
+kept out of screen capture with `WDA_EXCLUDEFROMCAPTURE`, so only the streamer
+sees it. It is created only when the first stream starts; disable it or change
+its corner in **Settings → General → Live indicator**. As with any normal
+desktop window, a truly exclusive fullscreen DirectX app can still cover it;
+borderless fullscreen and windowed apps cannot.
+
 ### Discord bot notification
 
 | Requirement | Where |
@@ -120,8 +131,6 @@ ffmpeg -version
 ## Build and run
 
 ```powershell
-cd screenshare-app
-
 .\build.ps1                 # full Windows release build, including Svelte UI
 
 go run ./cmd/streamy            # run in the foreground; Ctrl+C to quit
@@ -140,9 +149,9 @@ For a built app, keep `streamy.exe` and `streamy-ui.exe` together in
 `out\bin`; start `streamy.exe`. The tray process remains separate from the
 on-demand UI process. Windows 10/11 must have the Microsoft Edge WebView2
 Runtime installed to display settings. For source runs, first build with
-`.\build.ps1`, then run `go run ./cmd/streamy` from the `screenshare-app`
-directory; the tray locates the UI in `out\bin` even though `go run` itself
-uses a temporary executable directory.
+`.\build.ps1`, then run `go run ./cmd/streamy` from the repository root; the
+tray locates the UI in `out\bin` even though `go run` itself uses a temporary
+executable directory.
 
 ### Configure live browser sharing
 
@@ -201,6 +210,63 @@ them.
 For the manual SDP test tool, run `go run ./cmd/streamy-manual`. It prints an
 offer to paste into the local test viewer and waits for the browser's answer.
 
+### Run the local Activity stack (relay, gateway, viewer)
+
+The optional Activity path replaces WebRTC with one WebSocket media relay. Three
+services run from `streamy activity`, all on this machine by default:
+
+| Service | Default address | Purpose |
+| --- | --- | --- |
+| relay | `:8081` | `/v1/publish/<room>` accepts the desktop app's H.264/Opus frames; `/v1/watch/<room>` fans them out |
+| bot | `:8083` | lobby API, Discord OAuth, tunnel registration |
+| gateway | `:8080` | serves the viewer and proxies `/api/*` and `/.proxy/relay/*` on one port |
+
+```powershell
+go run ./cmd/streamy activity                    # relay + bot + gateway
+go run ./cmd/streamy activity -publish-token dev-token
+go run ./cmd/streamy activity -gateway :9000 -relay :9001 -bot :9002
+```
+
+Discord OAuth is optional: without `DISCORD_CLIENT_ID`,
+`DISCORD_CLIENT_SECRET` and `DISCORD_IDENTITY_SECRET` the relay, lobby and
+viewer still work, and only `/api/auth/*` answers 503. The viewer is embedded
+at `http://127.0.0.1:8080/`; use `-viewer-dir` to serve a different build. It
+decodes the relay's H.264 with WebCodecs, so use Chrome or Edge. Audio packets
+are counted but not played yet.
+
+Point the desktop app at the stack with a relay-only config block (the room is
+the Discord channel ID that viewers pass as `?room=`; the token must match
+`-publish-token`):
+
+```json
+{
+  "signaling": { "viewerURL": "" },
+  "stream": {
+    "relay": {
+      "enabled": true,
+      "only": true,
+      "url": "ws://127.0.0.1:8080/.proxy/relay",
+      "token": "dev-token",
+      "activityRoom": "123456789012345678"
+    }
+  }
+}
+```
+
+Then open `http://127.0.0.1:8080/?room=123456789012345678`, press the hotkey,
+and the relay's frames should appear in the page. A direct relay URL
+(`ws://127.0.0.1:8081`) also works if you do not need the viewer proxy.
+
+When `stream.relay.enabled` is true and the relay URL points at this machine,
+the tray starts `streamy activity` for you (and stops it on quit), so there is
+no second command to run. It also adopts an already-running healthy stack
+instead of starting a second copy. The listen ports follow the URL:
+`ws://127.0.0.1:9000/.proxy/relay` starts the gateway on 9000, the relay on 8081
+and the bot on 8083; a direct `ws://127.0.0.1:9001` starts the relay on 9001 and
+the gateway on 8080. If a port is busy, the child logs the exact failure to
+`%APPDATA%\streamy\stack\activity.log` and the app keeps running. After editing
+the relay block, restart Streamy so the launcher picks it up.
+
 ### Configure the Discord bot (optional)
 
 The bot posts one plain message containing the public viewer link when a stream
@@ -240,7 +306,7 @@ Notes:
   subcommand. An empty `stack.script` means "use the built-in bot"; a non-empty
   path is a legacy override for a custom launcher.
 - For a local test, run `go run ./cmd/streamy bot -env ..\stream-site\bot\.env`
-  from `screenshare-app`, then
+  from the repository root, then
   `../stream-site/dev/configure-desktop.ps1 -ChannelID <id>` to write the
   `discord` block. The bot listens on `http://127.0.0.1:8791` by default.
 - The bot is optional. Without it, the app still creates the viewer link and
@@ -428,6 +494,10 @@ are read from phase 3 onwards.
     "autoSwitchTarget": false,
     "captureCursor": true
   },
+  "indicator": {
+    "enabled": true,
+    "position": "top-right"
+  },
   "encoding": {
     "encoder": "auto",
     "ffmpegPath": "",
@@ -466,6 +536,9 @@ Notes:
 - **A bad value is rejected with a message** instead of failing halfway through
   a stream. `Config.Validate()` also caps viewers at the Worker limit and checks
   that STUN/TURN URLs use the right schemes.
+- **The live indicator** is enabled by default in the top right corner. Valid
+  positions are `top-right`, `top-left`, `bottom-right` and `bottom-left`; it is
+  shown only while a stream is live.
 - **Viewer count** can be `0` (use the Worker maximum) or `1`–`20`. The Worker
   still enforces its own hard cap.
 - **TURN settings** are shared in the viewer link fragment so the browser can

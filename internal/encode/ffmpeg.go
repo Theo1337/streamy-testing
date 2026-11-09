@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"streamy/internal/executil"
@@ -155,7 +157,8 @@ func (f FFmpeg) ProbeDDAGrab(ctx context.Context) error {
 		"-hide_banner", "-nostats", "-loglevel", "error",
 		// Desktop Duplication hands out D3D11 textures, so a D3D11 device has
 		// to exist for hwdownload to pull them back to system memory.
-		"-init_hw_device", "d3d11va",
+		"-init_hw_device", "d3d11va=d3d11va",
+		"-filter_hw_device", "d3d11va",
 		"-f", "lavfi", "-i", "ddagrab=framerate=30",
 		"-vf", "hwdownload,format=bgra",
 		"-frames:v", "1",
@@ -166,6 +169,49 @@ func (f FFmpeg) ProbeDDAGrab(ctx context.Context) error {
 		return fmt.Errorf("test capture with ddagrab: %w", err)
 	}
 	return nil
+}
+
+// ProbeDDAGrabOutput tests a specific ddagrab output index for black frames.
+//
+// It captures 3 frames from the given output_idx, computes mean luma via
+// ffmpeg's signalstats filter, and fails if the mean luma is below a small
+// threshold (5/255 ≈ 2% grey). This catches the Optimus laptop failure mode
+// where the D3D11 device is created on the dGPU but the monitor is driven by
+// the iGPU: ddagrab returns a valid stream of all-black frames with no error.
+func (f FFmpeg) ProbeDDAGrabOutput(ctx context.Context, outputIdx int) error {
+	args := []string{
+		"-hide_banner", "-nostats", "-loglevel", "error",
+		"-init_hw_device", "d3d11va=d3d11va",
+		"-filter_hw_device", "d3d11va",
+		"-f", "lavfi", "-i", fmt.Sprintf("ddagrab=output_idx=%d:framerate=%d", outputIdx, 30),
+		"-vf", "hwdownload,format=bgra,signalstats=stat=mean",
+		"-frames:v", "3",
+		"-f", "null", "-",
+	}
+
+	out, err := f.output(ctx, args...)
+	if err != nil {
+		return fmt.Errorf("ddagrab output_idx=%d test capture failed: %w", outputIdx, err)
+	}
+	if !hasMeanLumaAbove(out, 5.0) {
+		return fmt.Errorf("ddagrab output_idx=%d produces black frames (mean luma too low)", outputIdx)
+	}
+	return nil
+}
+
+// hasMeanLumaAbove parses ffmpeg's signalstats output for YAVG (mean luma)
+// and returns true if any frame's YAVG meets or exceeds the threshold.
+//
+// signalstats prints lines like: "[Parsed_signalstats_1 @ 0x...] YAVG: 123.45"
+// The regex extracts the numeric value after "YAVG:".
+func hasMeanLumaAbove(output string, threshold float64) bool {
+	re := regexp.MustCompile(`YAVG:\s*([\d.]+)`)
+	for _, match := range re.FindAllStringSubmatch(output, -1) {
+		if val, _ := strconv.ParseFloat(match[1], 64); val >= threshold {
+			return true
+		}
+	}
+	return false
 }
 
 // errorWithOutput attaches the tail of ffmpeg's output to an error.

@@ -48,7 +48,7 @@ func setWindowIcon() {
 	// for it instead of racing the framework.
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, title := range []string{"Streamy settings", "Streamy — Share your screen"} {
+		for _, title := range []string{"Streamy settings", "Streamy — Share your screen", "Streamy — Updating"} {
 			titlePtr, err := windows.UTF16PtrFromString(title)
 			if err != nil {
 				continue

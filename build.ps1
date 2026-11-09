@@ -49,6 +49,8 @@ Push-Location $root
 try {
     & $goExe build -ldflags $trayLdflags -o (Join-Path $output "streamy.exe") .\cmd\streamy
     if ($LASTEXITCODE -ne 0) { throw "tray build failed with exit code $LASTEXITCODE" }
+    & $goExe build -ldflags "-s -w -H=windowsgui" -o (Join-Path $output "streamy-updater.exe") .\cmd\streamy-updater
+    if ($LASTEXITCODE -ne 0) { throw "updater helper build failed with exit code $LASTEXITCODE" }
     & $goExe build -tags "production,desktop" -ldflags "-s -w -H=windowsgui" -o (Join-Path $output "streamy-ui.exe") .\ui
     if ($LASTEXITCODE -ne 0) { throw "settings UI build failed with exit code $LASTEXITCODE" }
     & $goExe build -o (Join-Path $output "streamy-capture.exe") .\cmd\streamy-capture

@@ -522,19 +522,21 @@ func capabilities(ctx context.Context, ffmpeg encode.FFmpeg, cfg config.Config, 
 	case "ddagrab":
 		// Trust the caller: if they name it, use it, and let the failure be
 		// theirs. This is what makes it possible to test a failing grabber.
-		return capture.Capabilities{DDAGrab: true}, nil
+		// Return a map with a sentinel key meaning "all outputs".
+		return capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, nil
 
 	case "gdigrab":
-		return capture.Capabilities{DDAGrab: false}, nil
+		return capture.Capabilities{DDAGrab: map[int]int8{}}, nil
 
 	case "", "auto":
 		start := time.Now()
 		if err := ffmpeg.ProbeDDAGrab(ctx); err != nil {
 			logger.Warn("ddagrab is unavailable, falling back to GDI", "error", err)
-			return capture.Capabilities{DDAGrab: false}, nil
+			return capture.Capabilities{DDAGrab: map[int]int8{}}, nil
 		}
 		logger.Debug("ddagrab is available", "probe", time.Since(start).Round(time.Millisecond))
-		return capture.Capabilities{DDAGrab: true}, nil
+		// Return a map with sentinel key meaning "all outputs healthy"
+		return capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, nil
 
 	default:
 		return capture.Capabilities{}, fmt.Errorf("unknown -grabber %q (want auto, ddagrab or gdigrab)", opts.grabber)

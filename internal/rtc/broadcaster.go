@@ -32,13 +32,15 @@ type Broadcaster struct {
 
 // Peer represents one viewer connection to a Broadcaster.
 type Peer struct {
-	id       string
-	pc       *webrtc.PeerConnection
-	source   *Broadcaster
-	failure  chan error
-	failOnce sync.Once
-	close    sync.Once
-	logger   Logger
+	id          string
+	pc          *webrtc.PeerConnection
+	source      *Broadcaster
+	failure     chan error
+	failOnce    sync.Once
+	close       sync.Once
+	connectOnce sync.Once
+	connected   chan struct{}
+	logger      Logger
 }
 
 // NewBroadcaster creates the shared H.264 track.
@@ -108,11 +110,12 @@ func (b *Broadcaster) AddPeer(id string, iceServers []webrtc.ICEServer) (*Peer, 
 		return nil, fmt.Errorf("add shared audio track for %s: %w", id, err)
 	}
 	peer := &Peer{
-		id:      id,
-		pc:      pc,
-		source:  b,
-		failure: make(chan error, 1),
-		logger:  b.logger,
+		id:        id,
+		pc:        pc,
+		source:    b,
+		failure:   make(chan error, 1),
+		connected: make(chan struct{}),
+		logger:    b.logger,
 	}
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		if peer.logger != nil {
@@ -125,6 +128,9 @@ func (b *Broadcaster) AddPeer(id string, iceServers []webrtc.ICEServer) (*Peer, 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		if peer.logger != nil {
 			peer.logger.Info("WebRTC connection state changed", "peer_id", id, "state", state.String())
+		}
+		if state == webrtc.PeerConnectionStateConnected {
+			peer.connectOnce.Do(func() { close(peer.connected) })
 		}
 		if state == webrtc.PeerConnectionStateFailed {
 			peer.reportFailure(errors.New("WebRTC peer connection failed"))
@@ -292,6 +298,25 @@ func (p *Peer) SetAnswer(answer string) error {
 
 // Failure is signalled when this viewer's ICE or peer connection fails.
 func (p *Peer) Failure() <-chan error { return p.failure }
+
+// Connected is closed once this viewer's WebRTC connection is established.
+// Waiting on it tells the host that video is actually reaching the viewer,
+// rather than that the viewer merely opened the page.
+func (p *Peer) Connected() <-chan struct{} { return p.connected }
+
+// WasConnected reports whether the viewer's connection was ever established.
+// It is safe to call on a nil peer.
+func (p *Peer) WasConnected() bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case <-p.connected:
+		return true
+	default:
+		return false
+	}
+}
 
 // Close releases the peer connection and its RTCP reader.
 func (p *Peer) Close() error {

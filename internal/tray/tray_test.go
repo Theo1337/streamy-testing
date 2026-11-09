@@ -37,13 +37,13 @@ func TestStatusText(t *testing.T) {
 			name:   "idle",
 			status: Status{},
 			word:   "sharing",
-			want:   "Not sharing",
+			want:   "",
 		},
 		{
 			name:   "idle, but the pipeline calls it recording",
 			status: Status{},
 			word:   "recording",
-			want:   "Not recording",
+			want:   "",
 		},
 		{
 			name:   "recording, from the pipeline's label",

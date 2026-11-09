@@ -157,6 +157,15 @@ type Window struct {
 	// Rect is the visible frame of the window. On Windows this is the DWM frame
 	// bounds, which excludes the invisible borders around a maximised window.
 	Rect Rect
+	// RawRect is the raw GetWindowRect bounds of the window, including any
+	// invisible borders that DWM hides from the user. PrintWindow renders into
+	// a DIB sized to these dimensions; capture code uses RawRect to compute
+	// correct offsets within the PrintWindow output.
+	// On non-Windows builds (or when GetWindowRect fails) this equals Rect.
+	RawRect Rect
+	// ClientRect is the client area of the window in screen coordinates,
+	// excluding the title bar and window borders (DWM frame).
+	ClientRect Rect
 	// Minimized and Visible come straight from the window state.
 	Minimized bool
 	Visible   bool
@@ -225,10 +234,13 @@ var ignoredWindowClasses = map[string]bool{
 // Decide applies the automatic target selection rules:
 //
 //  1. If the foreground window is a real window and covers its whole monitor,
+//     AND that monitor can be captured with Desktop Duplication (DXGIIndex >= 0),
 //     capture that monitor. Exclusive fullscreen games and borderless-windowed
 //     games both land here, and per-window capture of a fullscreen game is
 //     exactly the case that shows up black.
-//  2. Otherwise fall back to the configured default target.
+//  2. Otherwise fall back to the configured default target, preferring a monitor
+//     that can be captured with Desktop Duplication (DXGIIndex >= 0) to avoid
+//     black screens on multi-GPU systems.
 //
 // The returned Target always carries a Reason, including when the fallback was
 // used, so a misdetection can be diagnosed from the log alone.
@@ -245,24 +257,34 @@ func Decide(d Desktop, cfg config.Config) (Target, error) {
 		note = ` (capture.alwaysShowPicker is set, but the picker arrives in phase 6, so auto-selecting)`
 	}
 
-	// 1. A fullscreen foreground window wins.
+	// 1. A fullscreen foreground window wins, but only if its monitor can be
+	// captured with Desktop Duplication. If the monitor has no DXGI output
+	// (DXGIIndex < 0), Desktop Duplication is unavailable and capture would
+	// fall back to GDI, which produces black for fullscreen games.
 	if fg := d.Foreground; fg != nil && capturable(*fg, d.SelfPID) {
 		if idx := d.monitorContaining(fg.Rect); idx >= 0 {
 			m := d.Monitors[idx]
 			if m.Bounds.CoveredBy(fg.Rect, FullscreenTolerance) {
-				return Target{
-					Kind:       KindMonitor,
-					Monitor:    m,
-					Fullscreen: true,
-					Cursor:     cfg.Capture.CaptureCursor,
-					Reason: fmt.Sprintf("foreground window (%s) fills monitor %d (%s), capturing the whole monitor so fullscreen games do not come out black%s",
-						windowID(*fg), m.Index, m.Bounds, note),
-				}, nil
+				if m.DXGIIndex >= 0 {
+					return Target{
+						Kind:       KindMonitor,
+						Monitor:    m,
+						Fullscreen: true,
+						Cursor:     true, // cursor is always shown since the setting was removed
+						Reason: fmt.Sprintf("foreground window (%s) fills monitor %d (%s), capturing the whole monitor so fullscreen games do not come out black%s",
+							windowID(*fg), m.Index, m.Bounds, note),
+					}, nil
+				}
+				// Monitor has no DXGI output (likely on a different GPU), so
+				// Desktop Duplication would fail and GDI would produce black.
+				// Fall through to default target selection instead.
+				note += fmt.Sprintf("; ignoring fullscreen window on monitor %d (no DXGI output, would capture black)", m.Index)
 			}
 		}
 	}
 
-	// 2. Fall back to the configured default.
+	// 2. Fall back to the configured default, preferring a monitor with
+	// valid DXGIIndex to avoid black screens on multi-GPU systems.
 	switch cfg.Capture.DefaultTarget {
 	case config.TargetFocused:
 		if fg := d.Foreground; fg != nil && capturable(*fg, d.SelfPID) {
@@ -270,28 +292,32 @@ func Decide(d Desktop, cfg config.Config) (Target, error) {
 				"capture.defaultTarget is %q, using the focused window (%s)%s",
 				config.TargetFocused, windowID(*fg), note)), nil
 		}
-		return monitorTarget(d.primary(), cfg, "capture.defaultTarget is \"focused\" but nothing capturable has focus, using the primary monitor"+note), nil
-
-	case config.TargetMouse:
-		if d.MouseMonitor >= 0 && d.MouseMonitor < len(d.Monitors) {
-			return monitorTarget(d.Monitors[d.MouseMonitor], cfg, fmt.Sprintf(
-				"capture.defaultTarget is \"mouse\", using monitor %d under the pointer%s",
-				d.MouseMonitor, note)), nil
-		}
-		return monitorTarget(d.primary(), cfg, "capture.defaultTarget is \"mouse\" but the pointer's monitor is unknown, using the primary monitor"+note), nil
+		return monitorTarget(d.primaryWithDDAGrab(), cfg, "capture.defaultTarget is \"focused\" but nothing capturable has focus, using a monitor with Desktop Duplication"+note), nil
 
 	case config.TargetMonitor:
 		idx := cfg.Capture.MonitorIndex
 		if idx >= 0 && idx < len(d.Monitors) {
-			return monitorTarget(d.Monitors[idx], cfg, fmt.Sprintf(
-				"capture.defaultTarget is \"monitor\", using capture.monitorIndex %d%s", idx, note)), nil
+			m := d.Monitors[idx]
+			if m.DXGIIndex >= 0 {
+				return monitorTarget(m, cfg, fmt.Sprintf(
+					"capture.defaultTarget is \"monitor\", using capture.monitorIndex %d%s", idx, note)), nil
+			}
+			// Requested monitor has no DXGI output, try to find one that does.
+			if alt := d.monitorWithDDAGrab(); alt != nil {
+				return monitorTarget(*alt, cfg, fmt.Sprintf(
+					"capture.defaultTarget is \"monitor\" but monitor %d has no DXGI output, using monitor %d with Desktop Duplication%s",
+					idx, alt.Index, note)), nil
+			}
+			return monitorTarget(m, cfg, fmt.Sprintf(
+				"capture.defaultTarget is \"monitor\", using capture.monitorIndex %d (no DXGI output, will fall back to GDI)%s",
+				idx, note)), nil
 		}
-		return monitorTarget(d.primary(), cfg, fmt.Sprintf(
-			"capture.defaultTarget is \"monitor\" but capture.monitorIndex %d does not exist (%d monitors), using the primary monitor%s",
+		return monitorTarget(d.primaryWithDDAGrab(), cfg, fmt.Sprintf(
+			"capture.defaultTarget is \"monitor\" but capture.monitorIndex %d does not exist (%d monitors), using a monitor with Desktop Duplication%s",
 			idx, len(d.Monitors), note)), nil
 
 	default: // config.TargetPrimary, and anything unexpected
-		return monitorTarget(d.primary(), cfg, "capture.defaultTarget is \"primary\" (and no fullscreen window was found)"+note), nil
+		return monitorTarget(d.primaryWithDDAGrab(), cfg, "capture.defaultTarget is \"primary\" (and no fullscreen window was found)"+note), nil
 	}
 }
 
@@ -322,7 +348,7 @@ func monitorTarget(m Monitor, cfg config.Config, reason string) Target {
 	return Target{
 		Kind:    KindMonitor,
 		Monitor: m,
-		Cursor:  cfg.Capture.CaptureCursor,
+		Cursor:  true, // cursor is always shown since the setting was removed
 		Reason:  reason,
 	}
 }
@@ -331,7 +357,7 @@ func windowTarget(w Window, d Desktop, cfg config.Config, reason string) Target 
 	t := Target{
 		Kind:   KindWindow,
 		Window: w,
-		Cursor: cfg.Capture.CaptureCursor,
+		Cursor: true, // cursor is always shown since the setting was removed
 		Reason: reason,
 	}
 	if idx := d.monitorContaining(w.Rect); idx >= 0 {
@@ -365,11 +391,19 @@ func (t Target) WithDesktop(d Desktop) Target {
 // it occupies rather than through its own drawing surface. Clipping to the
 // monitor keeps the rectangle inside the duplicated (or GDI) surface, and it
 // also means a window dragged halfway off screen still captures what is left.
+//
+// For window capture, we use the client rect (excluding title bar and borders)
+// instead of the frame rect to avoid capturing the window frame.
 func (t Target) windowRegion() (Rect, bool) {
 	if t.Kind != KindWindow {
 		return Rect{}, false
 	}
-	region := t.Window.Rect.Intersect(t.Monitor.Bounds)
+	// Use ClientRect if available, otherwise fall back to frame Rect
+	winRect := t.Window.ClientRect
+	if winRect.Empty() {
+		winRect = t.Window.Rect
+	}
+	region := winRect.Intersect(t.Monitor.Bounds)
 	if region.Empty() {
 		return Rect{}, false
 	}
@@ -408,4 +442,36 @@ func intersectionArea(a, b Rect) int {
 		return 0
 	}
 	return w * h
+}
+
+// primaryWithDDAGrab returns the primary monitor if it has a valid DXGIIndex,
+// otherwise returns the first monitor with a valid DXGIIndex, or the primary
+// monitor as a last resort. This avoids black screens on multi-GPU systems
+// where the primary monitor is on a different GPU than the capture adapter.
+func (d Desktop) primaryWithDDAGrab() Monitor {
+	// First, try the actual primary monitor
+	for _, m := range d.Monitors {
+		if m.Primary && m.DXGIIndex >= 0 {
+			return m
+		}
+	}
+	// Primary monitor has no DXGI output (different GPU), find any monitor with DDAGrab
+	for _, m := range d.Monitors {
+		if m.DXGIIndex >= 0 {
+			return m
+		}
+	}
+	// No monitor has DDAGrab, fall back to the primary monitor (will use GDI)
+	return d.primary()
+}
+
+// monitorWithDDAGrab returns the first monitor with a valid DXGIIndex, or nil
+// if none exist.
+func (d Desktop) monitorWithDDAGrab() *Monitor {
+	for i := range d.Monitors {
+		if d.Monitors[i].DXGIIndex >= 0 {
+			return &d.Monitors[i]
+		}
+	}
+	return nil
 }

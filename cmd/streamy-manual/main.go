@@ -1,6 +1,6 @@
 // Command streamy-manual runs the phase 3 WebRTC test with manual SDP exchange.
 //
-// Run it from screenshare-app, then open the printed localhost URL in a
+// Run it from the repository root, then open the printed localhost URL in a
 // browser. This command is temporary test signaling; phase 4 replaces it with
 // the Cloudflare Worker client.
 package main
@@ -247,7 +247,7 @@ func locateViewer(configured string) (string, error) {
 			return absolute, nil
 		}
 	}
-	return "", errors.New("viewer index.html not found; run from the project root or screenshare-app, or set -viewer-dir")
+	return "", errors.New("viewer index.html not found; run from the project root, or set -viewer-dir")
 }
 
 func iceServers(cfg config.Config) []webrtc.ICEServer {

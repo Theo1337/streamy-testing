@@ -10,9 +10,11 @@ package tray
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"fyne.io/systray"
 
@@ -36,6 +38,17 @@ type Status struct {
 	// Target identifies what is being captured right now, so the picker can
 	// show a Live badge on the correct card.
 	Target *Target `json:"target,omitempty"`
+
+	// User info for the tray menu
+	UserName     string `json:"userName"`
+	UserAvatar   string `json:"userAvatar"`   // base64 data URL or empty
+	UserLoggedIn bool   `json:"userLoggedIn"`
+
+	// Update fields
+	UpdateReady      bool   `json:"updateReady"`
+	UpdateVersion    string `json:"updateVersion"`
+	UpdateProgress   int64  `json:"updateProgress"`
+	UpdateInstalling bool   `json:"updateInstalling"`
 }
 
 // Target is the capture target the picker should mark as live.
@@ -50,8 +63,10 @@ type Controller interface {
 	Status() Status
 	ToggleSharing()
 	OpenSettings()
+	OpenPicker() // Opens the window picker to start sharing
 	CopyViewerLink()
 	CheckForUpdates()
+	InstallUpdate()
 	Quit()
 }
 
@@ -72,12 +87,13 @@ type Tray struct {
 	title  string
 	opts   Options
 
-	mStatus       *systray.MenuItem
-	mStartStop    *systray.MenuItem
-	mSettings     *systray.MenuItem
-	mCopyLink     *systray.MenuItem
-	mCheckUpdates *systray.MenuItem
-	mQuit         *systray.MenuItem
+	mStatus        *systray.MenuItem
+	mStartStop     *systray.MenuItem
+	mSettings      *systray.MenuItem
+	mUser          *systray.MenuItem // User info display
+	mCheckUpdates  *systray.MenuItem
+	mInstallUpdate *systray.MenuItem
+	mQuit          *systray.MenuItem
 
 	// mu guards ready: menu items and the icon only exist after systray.Run has
 	// called onReady, but Refresh and Quit may be called before that.
@@ -173,8 +189,13 @@ func (t *Tray) onReady() {
 	t.mStatus.Disable()
 	t.mStartStop = systray.AddMenuItem("Start sharing", "Start or stop capturing the screen")
 	t.mSettings = systray.AddMenuItem("Open settings\u2026", "Hotkey, encoder, servers")
-	t.mCopyLink = systray.AddMenuItem("Copy viewer link", "Copy the link your viewers should open")
+	// User info display (disabled item showing user name)
+	t.mUser = systray.AddMenuItem("", "User info")
+	t.mUser.Disable()
+	t.mUser.Hide() // Hidden until user logs in
 	t.mCheckUpdates = systray.AddMenuItem("Check for updates\u2026", "Check for a new version")
+	t.mInstallUpdate = systray.AddMenuItem("Install Update", "Install the downloaded update")
+	t.mInstallUpdate.Hide() // Hidden until update is ready
 	systray.AddSeparator()
 	t.mQuit = systray.AddMenuItem("Quit", "Stop sharing and exit")
 
@@ -204,13 +225,26 @@ func (t *Tray) clickLoop() {
 	for {
 		select {
 		case <-t.mStartStop.ClickedCh:
-			t.ctrl.ToggleSharing()
+			status := t.ctrl.Status()
+			if status.Sharing {
+				t.ctrl.ToggleSharing() // Stop sharing
+			} else {
+				t.ctrl.OpenPicker() // Open window picker to start sharing
+			}
 		case <-t.mSettings.ClickedCh:
 			t.ctrl.OpenSettings()
-		case <-t.mCopyLink.ClickedCh:
-			t.ctrl.CopyViewerLink()
 		case <-t.mCheckUpdates.ClickedCh:
-			t.ctrl.CheckForUpdates()
+			// Show loading state in the tray menu
+			t.mCheckUpdates.SetTitle("Checking for updates...")
+			t.mCheckUpdates.Disable()
+			go func() {
+				t.ctrl.CheckForUpdates()
+				// Wait for the check to complete and notifications to show
+				time.Sleep(2 * time.Second)
+				t.Refresh() // Restore menu item state
+			}()
+		case <-t.mInstallUpdate.ClickedCh:
+			t.ctrl.InstallUpdate()
 		case <-t.mQuit.ClickedCh:
 			// Quit the app, not just the tray: the app stops the stream and
 			// then closes the tray, so no resource is left behind.
@@ -239,15 +273,43 @@ func (t *Tray) Refresh() {
 		t.mStartStop.SetTitle("Stop " + word)
 	} else {
 		systray.SetIcon(IconIdle())
-		t.mStartStop.SetTitle("Start " + word)
+		t.mStartStop.SetTitle("Start sharing")
 	}
 
 	text := statusText(status, word)
+
+	// Handle user display
+	if status.UserLoggedIn && status.UserName != "" {
+		t.mUser.SetTitle("\U0001F464 " + status.UserName)
+		t.mUser.Show()
+	} else {
+		t.mUser.Hide()
+	}
+
+	// Handle update status
+	if status.UpdateInstalling {
+		text = "Installing update..."
+		if status.UpdateProgress > 0 {
+			text = fmt.Sprintf("Installing update... (%d KB)", status.UpdateProgress/1024)
+		}
+	} else if status.UpdateReady {
+		text = fmt.Sprintf("Update ready: %s", status.UpdateVersion)
+		t.mInstallUpdate.Show()
+	} else {
+		t.mInstallUpdate.Hide()
+	}
+
 	t.mStatus.SetTitle(text)
 
 	tooltip := t.title + " \u2014 " + text
 	if status.ViewerURL != "" {
 		tooltip += "\n" + status.ViewerURL
+	}
+	if status.UpdateReady {
+		tooltip += fmt.Sprintf("\nUpdate %s ready to install", status.UpdateVersion)
+	}
+	if status.UpdateInstalling {
+		tooltip += "\nInstalling update..."
 	}
 	systray.SetTooltip(tooltip)
 }
@@ -276,5 +338,5 @@ func statusText(status Status, word string) string {
 		}
 		return "Sharing"
 	}
-	return "Not " + word
+	return "" // No "Not sharing" text
 }

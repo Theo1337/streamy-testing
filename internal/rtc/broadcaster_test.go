@@ -98,6 +98,23 @@ func TestBroadcasterSharesTrackWithMultipleViewers(t *testing.T) {
 		t.Fatalf("ViewerCount = %d, want %d", got, len(viewers))
 	}
 
+	// Each viewer's media path is reported as connected, which is what the
+	// host uses to play the "someone is watching" cue.
+	for id := range connectedViewers {
+		peer := broadcaster.Peer(id)
+		if peer == nil {
+			t.Fatalf("Peer(%q) is nil after connecting", id)
+		}
+		select {
+		case <-peer.Connected():
+		case <-ctx.Done():
+			t.Fatalf("peer %q never reported a connected media path", id)
+		}
+		if !peer.WasConnected() {
+			t.Fatalf("WasConnected(%q) = false after connecting", id)
+		}
+	}
+
 	// The first delta frame is dropped after peers join. The next IDR is
 	// delivered over the shared track to both PeerConnections.
 	if err := broadcaster.WriteSample([]byte{0, 0, 0, 1, 0x41, 0x80}, time.Second/30); err != nil {
@@ -144,6 +161,22 @@ func allTracksSeen(seen map[string]map[webrtc.RTPCodecType]bool, viewers int) bo
 		}
 	}
 	return true
+}
+
+func TestPeerWasConnectedBeforeNegotiation(t *testing.T) {
+	broadcaster, err := NewBroadcaster(nil)
+	if err != nil {
+		t.Fatalf("NewBroadcaster: %v", err)
+	}
+	defer broadcaster.Close()
+
+	peer, err := broadcaster.AddPeer("pending", nil)
+	if err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	if peer.WasConnected() {
+		t.Fatal("a fresh peer reported a connected media path")
+	}
 }
 
 func TestPLIRequestsKeyframeAndWaitsForNextIDR(t *testing.T) {

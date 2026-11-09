@@ -157,26 +157,6 @@ func TestDecideFocusedWindow(t *testing.T) {
 	}
 }
 
-func TestDecideMouseMonitor(t *testing.T) {
-	d := desktop()
-	d.MouseMonitor = 1
-	d.Foreground = window("Notes", "Notepad", 999, Rect{X: 100, Y: 100, Width: 800, Height: 600})
-
-	cfg := config.Default()
-	cfg.Capture.DefaultTarget = config.TargetMouse
-
-	target, err := Decide(d, cfg)
-	if err != nil {
-		t.Fatalf("Decide: %v", err)
-	}
-	if target.Kind != KindMonitor || target.Monitor.Index != 1 {
-		t.Errorf("got %s, want monitor 1", target.Describe())
-	}
-	if target.Monitor.DXGIIndex != 1 {
-		t.Errorf("DXGIIndex = %d, want 1", target.Monitor.DXGIIndex)
-	}
-}
-
 func TestDecideExplicitMonitor(t *testing.T) {
 	d := desktop()
 
@@ -352,8 +332,8 @@ func TestChooseGrabber(t *testing.T) {
 	}
 	offScreen := Target{Kind: KindWindow, Window: Window{Rect: Rect{X: 100, Y: 100, Width: 800, Height: 600}}}
 
-	withDDA := Capabilities{DDAGrab: true}
-	withoutDDA := Capabilities{DDAGrab: false}
+	withDDA := Capabilities{DDAGrab: map[int]int8{-1: DDAGrabHealthy}}
+	withoutDDA := Capabilities{DDAGrab: map[int]int8{}}
 
 	if got := mon.ChooseGrabber(withDDA); got != GrabberDDAGrab {
 		t.Errorf("monitor with ddagrab available: %q, want %q", got, GrabberDDAGrab)
@@ -377,6 +357,51 @@ func TestChooseGrabber(t *testing.T) {
 	}
 	if got := offScreen.ChooseGrabber(withDDA); got != GrabberGDigrab {
 		t.Errorf("window with no known monitor: %q, want %q", got, GrabberGDigrab)
+	}
+}
+
+func TestChooseGrabberPerOutputDDAGrab(t *testing.T) {
+	mon0 := Target{Kind: KindMonitor, Monitor: Monitor{Index: 0, DXGIIndex: 0}}
+	mon1 := Target{Kind: KindMonitor, Monitor: Monitor{Index: 1, DXGIIndex: 1}}
+	monBad := Target{Kind: KindMonitor, Monitor: Monitor{Index: 2, DXGIIndex: -1}}
+
+	// Sentinel -1: DDAGrabHealthy means global ddagrab available.
+	// Explicit DDAGrabUnhealthy for output 1 means that specific output failed the luma probe.
+	caps := Capabilities{DDAGrab: map[int]int8{-1: DDAGrabHealthy, 1: DDAGrabUnhealthy}}
+
+	if got := mon0.ChooseGrabber(caps); got != GrabberDDAGrab {
+		t.Errorf("monitor 0 (output_idx=0 healthy): %q, want %q", got, GrabberDDAGrab)
+	}
+	if got := mon1.ChooseGrabber(caps); got != GrabberGDigrab {
+		t.Errorf("monitor 1 (output_idx=1 black): %q, want %q", got, GrabberGDigrab)
+	}
+	if got := monBad.ChooseGrabber(caps); got != GrabberGDigrab {
+		t.Errorf("monitor with DXGIIndex=-1: %q, want %q", got, GrabberGDigrab)
+	}
+
+	// Empty map = no ddagrab at all (global probe failed)
+	if got := mon0.ChooseGrabber(Capabilities{DDAGrab: map[int]int8{}}); got != GrabberGDigrab {
+		t.Errorf("empty capabilities map: %q, want %q", got, GrabberGDigrab)
+	}
+
+	// nil map = no ddagrab probed yet, safe fallback
+	if got := mon0.ChooseGrabber(Capabilities{DDAGrab: nil}); got != GrabberGDigrab {
+		t.Errorf("nil capabilities map: %q, want %q", got, GrabberGDigrab)
+	}
+
+	// Sentinel -1: healthy, no per-output entries = all outputs healthy
+	allHealthy := Capabilities{DDAGrab: map[int]int8{-1: DDAGrabHealthy}}
+	if got := mon0.ChooseGrabber(allHealthy); got != GrabberDDAGrab {
+		t.Errorf("all healthy monitor 0: %q, want %q", got, GrabberDDAGrab)
+	}
+	if got := mon1.ChooseGrabber(allHealthy); got != GrabberDDAGrab {
+		t.Errorf("all healthy monitor 1: %q, want %q", got, GrabberDDAGrab)
+	}
+
+	// Sentinel -1: unhealthy = no ddagrab at all
+	allUnhealthy := Capabilities{DDAGrab: map[int]int8{-1: DDAGrabUnhealthy}}
+	if got := mon0.ChooseGrabber(allUnhealthy); got != GrabberGDigrab {
+		t.Errorf("all unhealthy: %q, want %q", got, GrabberGDigrab)
 	}
 }
 

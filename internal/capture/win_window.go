@@ -39,17 +39,34 @@ func windowByHandle(hwnd uintptr) (Window, bool) {
 		return Window{}, false
 	}
 
+	// RawRect is the actual GetWindowRect bounds. PrintWindow renders into a
+	// DC sized to these dimensions, so capture code uses rawRect to compute
+	// pixel-accurate offsets within the PrintWindow output.
+	rawRect, err := windowGetRect(hwnd)
+	if err != nil || rawRect.Empty() {
+		rawRect = rect
+	}
+
+	// Get the client rect (excluding title bar and borders)
+	clientRect, err := windowClientRect(hwnd)
+	if err != nil || clientRect.Empty() {
+		// Fall back to frame rect if client rect cannot be obtained
+		clientRect = rect
+	}
+
 	var pid uint32
 	windows.GetWindowThreadProcessId(windows.HWND(hwnd), &pid)
 
 	return Window{
-		Handle:    hwnd,
-		Title:     windowText(hwnd),
-		Class:     windowClass(hwnd),
-		PID:       pid,
-		Rect:      rect,
-		Minimized: minimized,
-		Visible:   visible,
+		Handle:      hwnd,
+		Title:       windowText(hwnd),
+		Class:       windowClass(hwnd),
+		PID:         pid,
+		Rect:        rect,
+		RawRect:     rawRect,
+		ClientRect:  clientRect,
+		Minimized:   minimized,
+		Visible:     visible,
 	}, true
 }
 
@@ -72,6 +89,53 @@ func windowFrame(hwnd uintptr) (Rect, error) {
 		return Rect{}, errors.New("GetWindowRect failed")
 	}
 	return rectFromWin32(r), nil
+}
+
+// windowGetRect returns the raw GetWindowRect bounds of a window. Unlike
+// windowFrame, this is not trimmed by DWM and represents the actual pixel
+// dimensions that PrintWindow renders into when called on this window.
+func windowGetRect(hwnd uintptr) (Rect, error) {
+	var r windows.Rect
+	if ret, _, _ := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r))); ret == 0 {
+		return Rect{}, errors.New("GetWindowRect failed")
+	}
+	return rectFromWin32(r), nil
+}
+
+// windowClientRect returns the client area of a window in screen coordinates,
+// excluding the title bar and window borders (DWM frame).
+func windowClientRect(hwnd uintptr) (Rect, error) {
+	var clientRect windows.Rect
+	// GetClientRect returns the client area in client coordinates (relative to window)
+	if ret, _, _ := procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&clientRect))); ret == 0 {
+		return Rect{}, errors.New("GetClientRect failed")
+	}
+
+	// Convert client coordinates to screen coordinates
+	// Top-left corner (0,0) in client coordinates
+	topLeft := point{X: 0, Y: 0}
+	if ret, _, _ := procClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&topLeft))); ret == 0 {
+		return Rect{}, errors.New("ClientToScreen failed for top-left")
+	}
+
+	// Bottom-right corner (width, height) in client coordinates
+	bottomRight := point{X: int32(clientRect.Right), Y: int32(clientRect.Bottom)}
+	if ret, _, _ := procClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&bottomRight))); ret == 0 {
+		return Rect{}, errors.New("ClientToScreen failed for bottom-right")
+	}
+
+	return Rect{
+		X:      int(topLeft.X),
+		Y:      int(topLeft.Y),
+		Width:  int(bottomRight.X - topLeft.X),
+		Height: int(bottomRight.Y - topLeft.Y),
+	}, nil
+}
+
+// point is a POINT structure for ClientToScreen.
+type point struct {
+	X int32
+	Y int32
 }
 
 func windowIsVisible(hwnd uintptr) bool {

@@ -40,7 +40,7 @@ func TestArgsDDAGrabMonitor(t *testing.T) {
 	cfg.Encoding.BitrateKbps = 4000
 	cfg.Encoding.KeyframeSeconds = 2
 
-	args, err := Args(cfg, monitorTarget(), EncoderNVENC, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, monitorTarget(), EncoderNVENC, capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestArgsDDAGrabMonitor(t *testing.T) {
 func TestArgsGDigrabMonitorWhenDDAGrabUnavailable(t *testing.T) {
 	cfg := config.Default()
 
-	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: false}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: map[int]int8{}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestArgsGDigrabMonitorWhenDDAGrabUnavailable(t *testing.T) {
 func TestArgsWindowTargetNeverUsesTheWindowTitle(t *testing.T) {
 	cfg := config.Default()
 
-	args, err := Args(cfg, windowTarget(), EncoderX264, capture.Capabilities{DDAGrab: false}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, windowTarget(), EncoderX264, capture.Capabilities{DDAGrab: map[int]int8{}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestArgsWindowTargetNeverUsesTheWindowTitle(t *testing.T) {
 func TestArgsWindowTargetCropsDDAGrab(t *testing.T) {
 	cfg := config.Default()
 
-	args, err := Args(cfg, windowTarget(), EncoderX264, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, windowTarget(), EncoderX264, capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestArgsEncoderSpecificFlags(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.encoder.Label, func(t *testing.T) {
-			args, err := Args(cfg, monitorTarget(), c.encoder, capture.Capabilities{DDAGrab: true}, Output{Pipe: true})
+			args, err := Args(cfg, monitorTarget(), c.encoder, capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, Output{Pipe: true})
 			if err != nil {
 				t.Fatalf("Args: %v", err)
 			}
@@ -184,7 +184,7 @@ func TestArgsExtraEncoderArgsComeLast(t *testing.T) {
 	cfg := config.Default()
 	cfg.Encoding.ExtraEncoderArgs = []string{"-cq", "20"}
 
-	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestArgsScalesWhenAsked(t *testing.T) {
 	cfg := config.Default()
 	cfg.Encoding.Resolution = "1280x720"
 
-	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestArgsSourceResolutionAddsNoScale(t *testing.T) {
 	cfg := config.Default()
 	cfg.Encoding.Resolution = "source"
 
-	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
+	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: map[int]int8{-1: capture.DDAGrabHealthy}}, Output{Path: "out.mp4"})
 	if err != nil {
 		t.Fatalf("Args: %v", err)
 	}
@@ -233,18 +233,6 @@ func TestArgsSourceResolutionAddsNoScale(t *testing.T) {
 	}
 }
 
-func TestArgsHonoursCaptureCursor(t *testing.T) {
-	cfg := config.Default()
-	cfg.Capture.CaptureCursor = false
-
-	args, err := Args(cfg, monitorTarget(), EncoderX264, capture.Capabilities{DDAGrab: true}, Output{Path: "out.mp4"})
-	if err != nil {
-		t.Fatalf("Args: %v", err)
-	}
-	if !strings.Contains(strings.Join(args, " "), "draw_mouse=0") {
-		t.Errorf("captureCursor=false was ignored: %v", args)
-	}
-}
 
 func TestOutputDefaults(t *testing.T) {
 	cases := []struct {
@@ -477,6 +465,52 @@ func TestFindRejectsAMissingPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ffmpegPath") {
 		t.Errorf("error %q does not name the setting the user has to fix", err)
+	}
+}
+
+func TestProbeDDAGrabOutputParsesLuma(t *testing.T) {
+	// Mock ffmpeg output with signalstats showing healthy luma values
+	out := `[Parsed_signalstats_1 @ 0x1] YAVG: 120.5
+[Parsed_signalstats_1 @ 0x1] YAVG: 118.2
+[Parsed_signalstats_1 @ 0x1] YAVG: 122.1
+`
+	if !hasMeanLumaAbove(out, 100.0) {
+		t.Error("should detect luma > 100")
+	}
+	if hasMeanLumaAbove(out, 130.0) {
+		t.Error("should not detect luma > 130")
+	}
+}
+
+func TestProbeDDAGrabOutputDetectsBlack(t *testing.T) {
+	// Mock ffmpeg output with signalstats showing black frames (YAVG=0)
+	out := `[Parsed_signalstats_1 @ 0x1] YAVG: 0.0
+[Parsed_signalstats_1 @ 0x1] YAVG: 0.0
+[Parsed_signalstats_1 @ 0x1] YAVG: 0.0
+`
+	if hasMeanLumaAbove(out, 5.0) {
+		t.Error("black frames (YAVG=0) should fail threshold")
+	}
+}
+
+func TestProbeDDAGrabOutputHandlesMissingSignalstats(t *testing.T) {
+	// Mock ffmpeg output without signalstats (e.g., error case)
+	out := `frame=  1 fps=0.0 q=0.0 size=       0kB time=00:00:00.03 bitrate=   0.0kbits/s
+Conversion failed!
+`
+	if hasMeanLumaAbove(out, 5.0) {
+		t.Error("missing signalstats should fail threshold")
+	}
+}
+
+func TestProbeDDAGrabOutputHandlesMixedFrames(t *testing.T) {
+	// Mixed: first two frames black, third frame has content
+	out := `[Parsed_signalstats_1 @ 0x1] YAVG: 0.0
+[Parsed_signalstats_1 @ 0x1] YAVG: 0.0
+[Parsed_signalstats_1 @ 0x1] YAVG: 85.3
+`
+	if !hasMeanLumaAbove(out, 50.0) {
+		t.Error("should detect luma > 50 from the third frame")
 	}
 }
 

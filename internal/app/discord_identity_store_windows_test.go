@@ -4,6 +4,8 @@ package app
 
 import (
 	"bytes"
+	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -22,5 +24,19 @@ func TestDiscordIdentityDPAPIProtectionRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(plain, token) {
 		t.Fatalf("unprotected token = %q, want original token", plain)
+	}
+}
+
+func TestCheckRealIdentity(t *testing.T) {
+	token, err := loadDiscordIdentity()
+	t.Logf("loadDiscordIdentity err: %v, token len: %d", err, len(token))
+	if token != "" {
+		profile, err := parseDiscordIdentity(token)
+		t.Logf("parseDiscordIdentity err: %v, profile: %+v", err, profile)
+		parts := strings.Split(token, ".")
+		if len(parts) == 3 {
+			p, _ := base64.RawURLEncoding.DecodeString(parts[1])
+			t.Logf("Claims JSON: %s", string(p))
+		}
 	}
 }

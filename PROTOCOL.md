@@ -1,6 +1,6 @@
 # Streamy signaling protocol â€” v1
 
-This is the **only** thing shared between `screenshare-app/` (the Go desktop app)
+This is the **only** thing shared between this repository (the Go desktop app)
 and `stream-site/` (the Cloudflare Worker and the browser viewer). Neither side
 imports the other; both implement this document independently.
 
@@ -280,7 +280,7 @@ nothing else until someone leaves:
 
 ## Implementation notes
 
-**Go side** (`screenshare-app/internal/signal/`, phase 4). The `Signaler`
+**Go side** (`internal/signal/`, phase 4). The `Signaler`
 interface exists so the WebSocket implementation can be swapped for something
 else later (a self-hosted server, libp2p). It should expose roughly:
 

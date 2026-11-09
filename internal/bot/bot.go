@@ -55,6 +55,7 @@ type Config struct {
 	WatchChannelID string
 	ViewerURL      string
 	Port           int
+	GuildID        string
 }
 
 // ConfigFromEnv reads the bot settings from the process environment. The .env
@@ -66,6 +67,7 @@ func ConfigFromEnv() (Config, error) {
 		WatchChannelID: strings.TrimSpace(os.Getenv("WATCH_CHANNEL_ID")),
 		ViewerURL:      strings.TrimSpace(os.Getenv("VIEWER_URL")),
 		Port:           DefaultPort,
+		GuildID:        strings.TrimSpace(os.Getenv("GUILD_ID")),
 	}
 	if cfg.ViewerURL == "" {
 		cfg.ViewerURL = defaultViewerURL
@@ -92,6 +94,9 @@ func (c Config) validate() error {
 	}
 	if c.Port < 1 || c.Port > 65535 {
 		return fmt.Errorf("port %d is out of range", c.Port)
+	}
+	if c.GuildID != "" && !channelIDPattern.MatchString(c.GuildID) {
+		return errors.New("guildID: must be a Discord snowflake")
 	}
 	return nil
 }
@@ -143,8 +148,8 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create Discord session: %w", err)
 	}
-	// Guilds is the only intent needed to fetch channels and send messages.
-	session.Identify.Intents = discordgo.IntentsGuilds
+	// Guilds and voice states are needed to resolve the voice channel a user is in.
+	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildVoiceStates
 	session.LogLevel = discordgo.LogWarning
 
 	if err := session.Open(); err != nil {
@@ -204,7 +209,8 @@ type bot struct {
 
 	quit     chan struct{}
 	quitOnce sync.Once
-}
+
+	}
 
 func newBot(client discordClient, botID string, cfg Config, logger *slog.Logger) *bot {
 	return &bot{
@@ -360,6 +366,11 @@ func (b *bot) resolveTargetChannel(requestedChannelID string) (*discordgo.Channe
 			continue
 		}
 		if channel != nil && isTextBased(channel) {
+			return channel, nil
+		}
+		// If the channel is a voice channel (or stage voice), return it as-is
+		// so the app doesn't get a 404 for a valid voice channel ID.
+		if channel != nil && (channel.Type == discordgo.ChannelTypeGuildVoice || channel.Type == discordgo.ChannelTypeGuildStageVoice) {
 			return channel, nil
 		}
 	}

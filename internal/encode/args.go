@@ -71,7 +71,7 @@ func ArgsWithInput(cfg config.Config, target capture.Target, enc Encoder, caps c
 		spec, err := target.InputSpec(capture.InputOptions{
 			Grabber:   grabber,
 			FPS:       fps,
-			DrawMouse: cfg.Capture.CaptureCursor,
+			DrawMouse: true, // cursor is always shown since the setting was removed
 			Scale:     resolutionScale(cfg.Encoding.Resolution),
 		})
 		if err != nil {
@@ -143,6 +143,7 @@ func videoArgs(cfg config.Config, enc Encoder, fps int) []string {
 			"-rc-lookahead", "0",
 			"-zerolatency", "1",
 			"-delay", "0",
+			"-forced-idr", "1",
 			"-profile:v", "baseline",
 		)
 

@@ -149,12 +149,6 @@ func (r *Recorder) Start(ctx context.Context, req Request) (Session, error) {
 	r.cancelRun = cancelRun
 	r.mu.Unlock()
 
-	if req.Config.Capture.AutoSwitchTarget && req.Target == nil {
-		// Off by default, because switching targets restarts the encoder and
-		// therefore starts a new file.
-		r.startWatcher(runCtx, req.Config, ffmpeg, encoder)
-	}
-
 	return session, nil
 }
 
@@ -181,7 +175,7 @@ func (r *Recorder) prepareCapture(ctx context.Context, cfg config.Config, ffmpeg
 	var target capture.Target
 	if requested != nil {
 		target = *requested
-		target.Cursor = cfg.Capture.CaptureCursor
+		target.Cursor = true // cursor is always shown since the setting was removed
 		if target.Kind == capture.KindWindow && target.Monitor.Bounds.Empty() {
 			// A window is recorded as the rectangle it occupies on the
 			// composited desktop; knowing its monitor allows the cheaper
@@ -370,6 +364,14 @@ func (r *Recorder) ensureFFmpeg(ctx context.Context, cfg config.Config) (encode.
 }
 
 // capabilities probes what this machine can do, once per process.
+//
+// It first runs a global ddagrab probe to see if Desktop Duplication works at
+// all. If it does, it then probes each monitor output individually to detect
+// the Optimus failure mode: ddagrab returns a valid stream of all-black frames
+// when the D3D11 device is created on the dGPU but the monitor is driven by
+// the iGPU. The per-output results are stored in Capabilities.DDAGrab as a map
+// from DXGI output index to usable/unusabe, so ChooseGrabber can fall back to
+// GDI only for the affected monitors.
 func (r *Recorder) capabilities(ctx context.Context, ffmpeg encode.FFmpeg, cfg config.Config) capture.Capabilities {
 	r.capsOnce.Do(func() {
 		if err := ffmpeg.ProbeDDAGrab(ctx); err != nil {
@@ -378,11 +380,46 @@ func (r *Recorder) capabilities(ctx context.Context, ffmpeg encode.FFmpeg, cfg c
 			// games, so it is worth saying out loud.
 			r.logger.Warn("Desktop Duplication (ddagrab) is unavailable, falling back to GDI capture; exclusive fullscreen games may record as a black screen",
 				"reason", err)
-			r.caps = capture.Capabilities{DDAGrab: false}
+			r.caps = capture.Capabilities{DDAGrab: map[int]int8{}}
 			return
 		}
-		r.logger.Debug("Desktop Duplication (ddagrab) is available")
-		r.caps = capture.Capabilities{DDAGrab: true}
+		r.logger.Debug("Desktop Duplication (ddagrab) is available, probing per-output health")
+
+		// Get the current desktop snapshot to know which monitors exist and
+		// their DXGI output indices.
+		desktop, err := r.targetResolver().Snapshot(ctx)
+		if err != nil {
+			r.logger.Warn("could not snapshot monitors for per-output ddagrab probe; falling back to GDI for all outputs",
+				"error", err)
+			r.caps = capture.Capabilities{DDAGrab: map[int]int8{}}
+			return
+		}
+
+		// Probe each monitor with a valid DXGI output index.
+		ddagrabOK := make(map[int]int8)
+		for _, m := range desktop.Monitors {
+			if m.DXGIIndex < 0 {
+				continue
+			}
+			if err := ffmpeg.ProbeDDAGrabOutput(ctx, m.DXGIIndex); err != nil {
+				r.logger.Warn("ddagrab failed for monitor output, will use GDI",
+					"monitor", m.Index, "dxgi_output", m.DXGIIndex, "error", err)
+				ddagrabOK[m.DXGIIndex] = capture.DDAGrabUnhealthy
+			} else {
+				r.logger.Debug("ddagrab healthy for monitor output",
+					"monitor", m.Index, "dxgi_output", m.DXGIIndex)
+				ddagrabOK[m.DXGIIndex] = capture.DDAGrabHealthy
+			}
+		}
+
+		if len(ddagrabOK) == 0 {
+			r.logger.Debug("no monitors with valid DXGI outputs to probe")
+			r.caps = capture.Capabilities{DDAGrab: map[int]int8{}}
+		} else {
+			// Set sentinel -1 to indicate global ddagrab availability
+			ddagrabOK[-1] = capture.DDAGrabHealthy
+			r.caps = capture.Capabilities{DDAGrab: ddagrabOK}
+		}
 	})
 	return r.caps
 }
@@ -512,6 +549,17 @@ func (r *Recorder) Session() Session {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.session
+}
+
+// FFmpegStderr returns the tail of ffmpeg's stderr for stall detection.
+// Returns empty string if no capture is running.
+func (r *Recorder) FFmpegStderr() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runner == nil {
+		return ""
+	}
+	return r.runner.Stderr()
 }
 
 // startWatcher polls for a changed target while the capture runs.
@@ -699,3 +747,6 @@ func fileURL(path string) string {
 	}
 	return (&url.URL{Scheme: "file", Path: slashed}).String()
 }
+
+// ViewerCount returns 0 for the recorder (no live viewers).
+func (r *Recorder) ViewerCount() int { return 0 }

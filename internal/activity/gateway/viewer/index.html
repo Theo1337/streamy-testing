@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Streamy Activity Viewer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        background: #11111b;
+        color: #cdd6f4;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      /* Activity mode: hide the manual header entirely */
+      body.activity header {
+        display: none;
+      }
+      body.activity footer {
+        display: none;
+      }
+      body.activity main {
+        padding: 0;
+      }
+      body.activity canvas {
+        max-width: 100vw;
+        max-height: 100vh;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        padding: 12px 16px;
+        background: #181825;
+        border-bottom: 1px solid #313244;
+      }
+      h1 {
+        font-size: 1rem;
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      .status {
+        font-size: 0.85rem;
+        opacity: 0.8;
+      }
+      .status[data-state="live"] {
+        color: #a6e3a1;
+        opacity: 1;
+      }
+      .status[data-state="error"] {
+        color: #f38ba8;
+        opacity: 1;
+      }
+      form {
+        display: flex;
+        gap: 8px;
+        margin-left: auto;
+      }
+      input {
+        background: #1e1e2e;
+        color: inherit;
+        border: 1px solid #45475a;
+        border-radius: 6px;
+        padding: 6px 10px;
+        font: inherit;
+        font-size: 0.85rem;
+        min-width: 14rem;
+      }
+      button {
+        background: #89b4fa;
+        color: #11111b;
+        border: 0;
+        border-radius: 6px;
+        padding: 6px 14px;
+        font: inherit;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #b4befe;
+      }
+      button.secondary {
+        background: #313244;
+        color: #cdd6f4;
+      }
+      main {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        position: relative;
+        background: #000;
+      }
+      canvas {
+        max-width: 100%;
+        max-height: calc(100vh - 90px);
+        background: #000;
+        display: none;
+      }
+      #placeholder {
+        text-align: center;
+        max-width: 40rem;
+        line-height: 1.5;
+      }
+      #placeholder h2 {
+        margin: 0 0 0.5rem;
+        font-size: 1.15rem;
+      }
+      #placeholder p {
+        margin: 0.25rem 0;
+        opacity: 0.75;
+        font-size: 0.9rem;
+      }
+      #placeholder code {
+        background: #1e1e2e;
+        padding: 1px 5px;
+        border-radius: 4px;
+      }
+      footer {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        padding: 8px 16px;
+        background: #181825;
+        border-top: 1px solid #313244;
+        font-size: 0.78rem;
+        opacity: 0.8;
+      }
+      footer b {
+        font-weight: 600;
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Streamy Activity Viewer</h1>
+      <span id="status" class="status" data-state="idle">idle</span>
+      <form id="connect-form">
+        <input
+          id="room"
+          type="text"
+          placeholder="room / Discord channel ID"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button type="submit" id="connect">Connect</button>
+        <button type="button" class="secondary" id="disconnect">
+          Disconnect
+        </button>
+      </form>
+    </header>
+    <main>
+      <canvas id="video"></canvas>
+      <div id="placeholder">
+        <h2>Waiting for a stream</h2>
+        <p>
+          Start sharing in Streamy, then connect to the room it publishes to.
+        </p>
+        <p>
+          Open this page as <code>/?room=&lt;room-id&gt;</code> to connect
+          automatically.
+        </p>
+        <p>
+          The relay, bot and gateway are the local Activity stack from
+          <code>streamy activity</code>; media arrives over the relay WebSocket.
+        </p>
+      </div>
+    </main>
+    <footer>
+      <span>codec <b id="codec">—</b></span>
+      <span>resolution <b id="resolution">—</b></span>
+      <span>video <b id="fps">0</b> fps</span>
+      <span>audio <b id="audio">0</b> pkts</span>
+      <span>received <b id="bandwidth">0</b> kb/s</span>
+    </footer>
+
+    <script type="module">
+      "use strict";
+
+      // ── Discord Activity detection ───────────────────────────────────────────────
+      function isActivity() {
+        const params = new URLSearchParams(location.search);
+        return (
+          params.has("frame_id") ||
+          /(^|\.)discordsays\.com$/i.test(location.hostname)
+        );
+      }
+
+      // ── Bootstrap the Discord Embedded App SDK and return the relay room ─────────
+      async function bootstrapActivity(clientId) {
+        let DiscordSDK;
+        try {
+          try {
+            ({ DiscordSDK } =
+              await import("https://unpkg.com/@discord/embedded-app-sdk@latest/output/index.mjs"));
+          } catch {
+            ({ DiscordSDK } =
+              await import("https://cdn.jsdelivr.net/npm/@discord/embedded-app-sdk@latest/output/index.mjs"));
+          }
+        } catch (err) {
+          throw new Error(
+            "Failed to load the Discord Embedded App SDK: " + err.message,
+          );
+        }
+
+        const sdk = new DiscordSDK(clientId);
+        setStatus("Connecting to Discord…");
+        await sdk.ready();
+
+        let code;
+        try {
+          const auth = await sdk.commands.authorize({
+            client_id: clientId,
+            response_type: "code",
+            state: "streamy",
+            prompt: "none",
+            scope: ["identify", "guilds"],
+          });
+          code = auth.code;
+        } catch (err) {
+          throw new Error("Discord authorization failed: " + err.message);
+        }
+        if (!code)
+          throw new Error("Discord did not return an authorization code.");
+
+        setStatus("Authenticating with Discord…");
+        let tokenResp = null;
+        for (const endpoint of ["/.proxy/api/token", "/api/token", "/token"]) {
+          try {
+            const resp = await fetch(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ code }),
+            });
+            if (resp.ok) {
+              tokenResp = resp;
+              break;
+            }
+          } catch {
+            /* try next */
+          }
+        }
+        if (!tokenResp) {
+          throw new Error(
+            "Token exchange failed: could not connect to token endpoint",
+          );
+        }
+        const tokenData = await tokenResp.json();
+        if (!tokenData.access_token)
+          throw new Error("Token exchange returned no access_token.");
+
+        try {
+          await sdk.commands.authenticate({
+            access_token: tokenData.access_token,
+          });
+        } catch (err) {
+          throw new Error("Discord authentication failed: " + err.message);
+        }
+
+        const room = sdk.channelId || sdk.instanceId;
+        if (!room)
+          throw new Error("Discord did not provide a channel or instance ID.");
+        return String(room);
+      }
+
+      // ── DOM refs ─────────────────────────────────────────────────────────────────
+      const statusEl = document.getElementById("status");
+      const roomInput = document.getElementById("room");
+      const canvas = document.getElementById("video");
+      const placeholder = document.getElementById("placeholder");
+      const codecEl = document.getElementById("codec");
+      const resolutionEl = document.getElementById("resolution");
+      const fpsEl = document.getElementById("fps");
+      const audioEl = document.getElementById("audio");
+      const bandwidthEl = document.getElementById("bandwidth");
+
+      // ── Relay protocol constants (must match internal/activity/protocol) ──────────
+      const RELAY_PROTOCOL_VERSION = 1;
+      const MEDIA_HEADER_SIZE = 10;
+      const MEDIA_VIDEO = 0x01;
+      const MEDIA_AUDIO = 0x02;
+      const FLAG_KEYFRAME = 0x01;
+
+      // ── State ────────────────────────────────────────────────────────────────────
+      const params = new URLSearchParams(location.search);
+      let socket = null;
+      let decoder = null;
+      let decoderCodec = "";
+      let lastVideoTimestamp = 0;
+      let audioPackets = 0;
+      let videoFrames = 0;
+      let bytesReceived = 0;
+      let statsTimer = null;
+      let reconnectTimer = null;
+      let manualDisconnect = false;
+      let lastSps = null;
+      let lastPps = null;
+      let inActivity = false;
+      let awaitingKeyframe = true;
+
+      // ── Status display ───────────────────────────────────────────────────────────
+      function setStatus(text, state) {
+        statusEl.textContent = text;
+        statusEl.dataset.state = state || "idle";
+      }
+
+      function showCanvas(show) {
+        canvas.style.display = show ? "block" : "none";
+        placeholder.style.display = show ? "none" : "block";
+      }
+
+      // ── Relay URL construction ───────────────────────────────────────────────────
+      function relayURL(room) {
+        const override = params.get("relay");
+        if (override && override !== "1") {
+          return (
+            override.replace(/\/+$/, "") +
+            "/v1/watch/" +
+            encodeURIComponent(room)
+          );
+        }
+        const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+        return (
+          scheme +
+          "//" +
+          location.host +
+          "/.proxy/relay/v1/watch/" +
+          encodeURIComponent(room)
+        );
+      }
+
+      // ── Connection ───────────────────────────────────────────────────────────────
+      function connect(room) {
+        disconnect(true);
+        manualDisconnect = false;
+        lastSps = null;
+        lastPps = null;
+        decoderCodec = "";
+        lastVideoTimestamp = 0;
+        audioPackets = 0;
+        videoFrames = 0;
+        bytesReceived = 0;
+        awaitingKeyframe = true;
+
+        if (!inActivity) {
+          roomInput.value = room;
+        }
+
+        const url = relayURL(room);
+        setStatus("connecting to " + room + "…");
+        let ws;
+        try {
+          ws = new WebSocket(url);
+        } catch (err) {
+          setStatus("invalid relay URL: " + err.message, "error");
+          return;
+        }
+        ws.binaryType = "arraybuffer";
+        socket = ws;
+
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({
+              v: RELAY_PROTOCOL_VERSION,
+              type: "hello",
+              role: "viewer",
+            }),
+          );
+          setStatus("waiting for relay to accept…");
+        };
+        ws.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            handleControl(event.data);
+            return;
+          }
+          bytesReceived += event.data.byteLength;
+          handleMedia(new Uint8Array(event.data));
+        };
+        ws.onerror = () => {
+          setStatus("relay connection error", "error");
+        };
+        ws.onclose = (event) => {
+          if (socket === ws) socket = null;
+          if (manualDisconnect) {
+            setStatus("disconnected");
+            return;
+          }
+          const reason = event.reason ? " (" + event.reason + ")" : "";
+          setStatus("relay closed" + reason + "; retrying…", "error");
+          reconnectTimer = setTimeout(() => connect(room), 1500);
+        };
+
+        if (!statsTimer) {
+          statsTimer = setInterval(updateStats, 1000);
+        }
+      }
+
+      function disconnect(silent) {
+        manualDisconnect = true;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        if (socket) {
+          const ws = socket;
+          socket = null;
+          ws.close();
+        }
+        resetDecoder();
+        if (!silent) {
+          setStatus("disconnected");
+        }
+      }
+
+      // ── Control message handling ─────────────────────────────────────────────────
+      function handleControl(text) {
+        let message;
+        try {
+          message = JSON.parse(text);
+        } catch {
+          return;
+        }
+        switch (message.type) {
+          case "ready":
+            setStatus("connected; waiting for video", "live");
+            break;
+          case "error":
+            setStatus(
+              (message.code || "error") + ": " + (message.message || ""),
+              "error",
+            );
+            break;
+          case "pong":
+          case "ping":
+            break;
+        }
+      }
+
+      // ── Media handling ───────────────────────────────────────────────────────────
+      function handleMedia(data) {
+        if (data.byteLength < MEDIA_HEADER_SIZE) return;
+        const kind = data[0];
+        const flags = data[1];
+        const view = new DataView(
+          data.buffer,
+          data.byteOffset,
+          data.byteLength,
+        );
+        const timestamp = Number(view.getBigUint64(2, false));
+        const payload = data.subarray(MEDIA_HEADER_SIZE);
+
+        if (kind === MEDIA_AUDIO) {
+          audioPackets += 1;
+          return;
+        }
+        if (kind !== MEDIA_VIDEO) return;
+        decodeVideo(payload, flags, timestamp);
+      }
+
+      function decodeVideo(payload, flags, timestampMs) {
+        const nalus = splitAnnexB(payload);
+        let sps = null,
+          pps = null;
+        let hasSps = false,
+          hasPps = false;
+
+        for (const nalu of nalus) {
+          if (nalu.length === 0) continue;
+          const type = nalu[0] & 0x1f;
+          if (type === 7) {
+            sps = nalu;
+            hasSps = true;
+          }
+          if (type === 8) {
+            pps = nalu;
+            hasPps = true;
+          }
+        }
+        if (sps) lastSps = sps;
+        if (pps) lastPps = pps;
+
+        if (!lastSps || !lastPps) {
+          setStatus("receiving video, waiting for SPS/PPS…");
+          return;
+        }
+
+        const keyframe = (flags & FLAG_KEYFRAME) !== 0;
+        if (awaitingKeyframe && !keyframe) return;
+        if (!ensureDecoder()) return;
+
+        // Ensure keyframes always carry Annex-B SPS and PPS NAL units
+        let chunkData = payload;
+        if (keyframe && (!hasSps || !hasPps)) {
+          const startCode = new Uint8Array([0, 0, 0, 1]);
+          const totalLen =
+            startCode.length +
+            lastSps.length +
+            startCode.length +
+            lastPps.length +
+            payload.length;
+          const combined = new Uint8Array(totalLen);
+          let offset = 0;
+
+          combined.set(startCode, offset);
+          offset += startCode.length;
+          combined.set(lastSps, offset);
+          offset += lastSps.length;
+
+          combined.set(startCode, offset);
+          offset += startCode.length;
+          combined.set(lastPps, offset);
+          offset += lastPps.length;
+
+          combined.set(payload, offset);
+          chunkData = combined;
+        }
+
+        awaitingKeyframe = false;
+
+        let timestamp = timestampMs * 1000;
+        if (timestamp <= lastVideoTimestamp) {
+          timestamp = lastVideoTimestamp + 1;
+        }
+        lastVideoTimestamp = timestamp;
+
+        try {
+          decoder.decode(
+            new EncodedVideoChunk({
+              type: keyframe ? "key" : "delta",
+              timestamp,
+              data: chunkData.slice(),
+            }),
+          );
+          showCanvas(true);
+        } catch (err) {
+          setStatus("decode error: " + err.message, "error");
+          resetDecoder();
+        }
+      }
+
+      function ensureDecoder() {
+        const codec = codecString(lastSps);
+        if (!codec) return false;
+        if (decoder && decoderCodec === codec && decoder.state === "configured")
+          return true;
+        resetDecoder();
+        if (typeof VideoDecoder === "undefined") {
+          setStatus("no WebCodecs VideoDecoder; use Chrome or Edge", "error");
+          return false;
+        }
+        try {
+          decoder = new VideoDecoder({
+            output: renderFrame,
+            error: (err) => {
+              setStatus("decoder error: " + err.message, "error");
+              resetDecoder();
+            },
+          });
+          decoder.configure({
+            codec,
+            optimizeForLatency: true,
+            hardwareAcceleration: "prefer-hardware",
+          });
+          decoderCodec = codec;
+          codecEl.textContent = codec;
+          return true;
+        } catch (err) {
+          setStatus("cannot configure " + codec + ": " + err.message, "error");
+          resetDecoder();
+          return false;
+        }
+      }
+
+      function resetDecoder() {
+        if (decoder) {
+          try {
+            decoder.close();
+          } catch {
+            /* already closed */
+          }
+          decoder = null;
+        }
+        decoderCodec = "";
+        awaitingKeyframe = true;
+        lastVideoTimestamp = 0;
+      }
+
+      function renderFrame(frame) {
+        try {
+          if (
+            canvas.width !== frame.displayWidth ||
+            canvas.height !== frame.displayHeight
+          ) {
+            canvas.width = frame.displayWidth;
+            canvas.height = frame.displayHeight;
+            resolutionEl.textContent =
+              frame.displayWidth + "×" + frame.displayHeight;
+          }
+          const ctx = canvas.getContext("2d", { alpha: false });
+          ctx.drawImage(frame, 0, 0);
+          videoFrames += 1;
+          if (statusEl.dataset.state !== "live") setStatus("live", "live");
+        } finally {
+          frame.close();
+        }
+      }
+
+      function updateStats() {
+        fpsEl.textContent = String(videoFrames);
+        audioEl.textContent = String(audioPackets);
+        bandwidthEl.textContent = String(
+          Math.round((bytesReceived * 8) / 1000),
+        );
+        videoFrames = 0;
+        audioPackets = 0;
+        bytesReceived = 0;
+      }
+
+      // ── Annex-B splitter ─────────────────────────────────────────────────────────
+      function splitAnnexB(data) {
+        const nals = [];
+        let start = -1;
+        for (let i = 0; i + 2 < data.length; ) {
+          let startCode = 0;
+          if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+            startCode = 3;
+          } else if (
+            i + 3 < data.length &&
+            data[i] === 0 &&
+            data[i + 1] === 0 &&
+            data[i + 2] === 0 &&
+            data[i + 3] === 1
+          ) {
+            startCode = 4;
+          }
+          if (startCode === 0) {
+            i++;
+            continue;
+          }
+          if (start >= 0) nals.push(data.subarray(start, i));
+          start = i + startCode;
+          i = start;
+        }
+        if (start >= 0 && start < data.length) nals.push(data.subarray(start));
+        return nals;
+      }
+
+      // ── Codec string from SPS ────────────────────────────────────────────────────
+      function codecString(sps) {
+        if (!sps || sps.length < 4) return "";
+        const hex = (v) => v.toString(16).padStart(2, "0");
+        return "avc1." + hex(sps[1]) + hex(sps[2]) + hex(sps[3]);
+      }
+
+      // ── Event wiring for manual mode ─────────────────────────────────────────────
+      document
+        .getElementById("connect-form")
+        .addEventListener("submit", (event) => {
+          event.preventDefault();
+          const room = roomInput.value.trim();
+          if (!room) {
+            setStatus("enter a room id", "error");
+            return;
+          }
+          connect(room);
+        });
+      document
+        .getElementById("disconnect")
+        .addEventListener("click", () => disconnect(false));
+
+      // ── Startup ───────────────────────────────────────────────────────────────────
+      async function init() {
+        if (isActivity()) {
+          inActivity = true;
+          document.body.classList.add("activity");
+          setStatus("Starting Discord Activity…");
+
+          let clientId = "";
+          for (const u of [
+            "/api/config",
+            "/.proxy/api/config",
+            "/config.json",
+            "/.proxy/config.json",
+          ]) {
+            try {
+              const r = await fetch(u, { cache: "no-store" });
+              if (r.ok) {
+                const cfg = await r.json();
+                if (cfg && cfg.discordClientID) {
+                  clientId = cfg.discordClientID;
+                  break;
+                }
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+
+          if (!clientId) {
+            clientId = "1539962249718792203";
+          }
+
+          let room;
+          try {
+            room = await bootstrapActivity(clientId);
+          } catch (err) {
+            setStatus(err.message, "error");
+            return;
+          }
+          connect(room);
+          return;
+        }
+
+        const roomParam = params.get("room") || params.get("relay") || "";
+        roomInput.value = roomParam;
+        if (roomParam) {
+          connect(roomParam);
+        }
+      }
+
+      void init();
+    </script>
+  </body>
+</html>

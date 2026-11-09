@@ -36,6 +36,10 @@ type Streamer interface {
 	// session. Viewers keep the same link and connection; the encoder starts a
 	// new stream and the broadcaster requests a keyframe.
 	SwitchTarget(ctx context.Context, target capture.Target) (Session, error)
+
+	// ViewerCount returns the current number of connected viewers.
+	// Returns 0 if not applicable (e.g., recording only).
+	ViewerCount() int
 }
 
 // Request is everything a Streamer needs to start.
@@ -46,8 +50,18 @@ type Request struct {
 	Target *capture.Target
 	// IdentityToken is a Worker-signed Discord host identity.
 	IdentityToken string
+	// UserID is the Discord user ID, used to resolve the voice channel the
+	// streamer is currently in for Discord Activity.
+	UserID string
 	// UserName is the Discord display name the bot puts in its message.
 	UserName string
+	// OnViewerWatching is called once per viewer when their WebRTC connection
+	// is established, meaning video is actually reaching them. It runs on its
+	// own goroutine and must not block. Optional.
+	OnViewerWatching func()
+	// OnViewerLeft is called when a viewer that was watching disconnects.
+	// It runs on the signaling goroutine, so it must not block. Optional.
+	OnViewerLeft func()
 }
 
 // Session describes a running pipeline.
@@ -102,3 +116,5 @@ func (s *Stub) Stop(context.Context) error { return nil }
 func (s *Stub) SwitchTarget(context.Context, capture.Target) (Session, error) {
 	return Session{}, ErrNotImplemented
 }
+
+func (s *Stub) ViewerCount() int { return 0 }

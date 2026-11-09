@@ -62,6 +62,8 @@ func (f *fakeStreamer) SwitchTarget(_ context.Context, target capture.Target) (p
 	return session, nil
 }
 
+func (f *fakeStreamer) ViewerCount() int { return 0 }
+
 func (f *fakeStreamer) counts() (starts, stops int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

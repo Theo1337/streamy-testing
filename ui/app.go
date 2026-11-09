@@ -114,6 +114,22 @@ func (a *SettingsApp) GetStatus() (map[string]any, error) {
 	return status, err
 }
 
+func (a *SettingsApp) GetUpdateProgress() (map[string]any, error) {
+	var progress map[string]any
+	err := a.request(http.MethodGet, "/api/update", nil, &progress)
+	return progress, err
+}
+
+func (a *SettingsApp) CheckForUpdates() (map[string]any, error) {
+	var result map[string]any
+	err := a.request(http.MethodPost, "/api/check-updates", struct{}{}, &result)
+	return result, err
+}
+
+func (a *SettingsApp) InstallUpdate() error {
+	return a.request(http.MethodPost, "/api/install-update", struct{}{}, nil)
+}
+
 func (a *SettingsApp) GetDiscordIdentity() (map[string]any, error) {
 	var identity map[string]any
 	err := a.request(http.MethodGet, "/api/discord/profile", nil, &identity)

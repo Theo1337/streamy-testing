@@ -22,7 +22,6 @@ bitrate, encoder, STUN/TURN, signaling endpoints and viewer count.
 ## Build
 
 ```powershell
-cd screenshare-app
 .\build.ps1
 ```
 

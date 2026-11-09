@@ -18,12 +18,12 @@ var frontend embed.FS
 func main() {
 	address := flag.String("ipc-address", "", "authenticated tray IPC address")
 	token := flag.String("ipc-token", "", "one-time tray IPC token")
-	view := flag.String("view", "settings", "window to show: settings or share")
+	view := flag.String("view", "settings", "window to show: settings, share, or update")
 	flag.Parse()
 	if *address == "" || *token == "" {
 		log.Fatal("Streamy UI must be launched by the tray process")
 	}
-	if *view != "share" {
+	if *view != "share" && *view != "update" {
 		*view = "settings"
 	}
 	assets, err := fs.Sub(frontend, "frontend/dist")
@@ -34,21 +34,29 @@ func main() {
 	title := "Streamy settings"
 	width := 980
 	height := 760
+	disableResize := false
 	if *view == "share" {
 		title = "Streamy — Share your screen"
 		width = 1100
 		height = 780
+	} else if *view == "update" {
+		title = "Streamy — Updating"
+		width = 480
+		height = 380
+		// The update view is a small fixed progress dialog. Allowing it to be
+		// resized smaller than its content was what produced a scrollbar.
+		disableResize = true
 	}
 	err = wails.Run(&options.App{
 		Title:            title,
 		Width:            width,
 		Height:           height,
-		MinWidth:         720,
-		MinHeight:        560,
+		MinWidth:         400,
+		MinHeight:        200,
 		AssetServer:      &assetserver.Options{Assets: assets},
 		BackgroundColour: &options.RGBA{R: 17, G: 24, B: 39, A: 1},
 		WindowStartState: options.Normal,
-		DisableResize:    false,
+		DisableResize:    disableResize,
 		Frameless:        false,
 		DragAndDrop:      nil,
 		OnStartup:        app.startup,
